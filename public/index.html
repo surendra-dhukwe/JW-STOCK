@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JW-ST | Stock Management</title><link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="toast" class="toast"></div>
+  <main id="authView" class="auth-wrap">
+    <section class="auth-card">
+      <div class="brand-mark">JW<span>-ST</span></div>
+      <p class="muted">Stock Management Workspace</p>
+      <div class="tabs"><button class="tab active" data-tab="login">Login</button><button class="tab" data-tab="register">New User</button></div>
+      <form id="loginForm">
+        <label>Username</label><input name="username" required autocomplete="username">
+        <label>Password</label>
+<div class="password-box">
+  <input
+    id="loginPassword"
+    name="password"
+    type="password"
+    required
+    autocomplete="current-password"
+    placeholder="Enter your password"
+  >
+  <button
+    type="button"
+    class="password-toggle"
+    data-target="loginPassword"
+    aria-label="Show password"
+  >👁</button>
+</div>
+        <button class="primary full">Login</button>
+      </form>
+      <form id="registerForm" class="hidden">
+        <label>Your Name</label><input name="name" required maxlength="70">
+        <label>Create Username</label><input name="username" required minlength="3">
+        <label>Password (minimum 8 characters)</label>
+<div class="password-box">
+  <input
+    id="registerPassword"
+    name="password"
+    type="password"
+    required
+    minlength="8"
+    placeholder="Create your password"
+  >
+  <button
+    type="button"
+    class="password-toggle"
+    data-target="registerPassword"
+    aria-label="Show password"
+  >👁</button>
+</div>
+        <button class="primary full">Send Registration Request</button>
+        <p class="hint">Your account will become active after Admin approval.</p>
+      </form>
+    </section>
+  </main>
+
+  <div id="appView" class="layout hidden">
+    <aside class="sidebar">
+      <div class="brand-mark">JW<span>-ST</span></div><div id="profile" class="profile"></div>
+      <nav>
+        <button class="nav active" data-page="dashboard">▦ Dashboard</button>
+        <button class="nav" data-page="stock">▤ Stock & Items</button>
+        <button class="nav" data-page="transactions">⇄ Transactions</button>
+        <button class="nav" data-page="chat">◉ Team Chat</button>
+        <button class="nav admin-only" data-page="approvals">✓ Approvals</button>
+        <button class="nav admin-only" data-page="users">♙ Users</button>
+      </nav>
+      <button id="logoutBtn" class="logout">Log out ↗</button>
+    </aside>
+    <section class="main">
+      <header><div><p class="eyebrow">WORKSPACE / <span id="pageName">DASHBOARD</span></p><h1 id="pageTitle">Dashboard</h1></div><div class="status-pill">● System Online</div></header>
+      <div id="content"></div>
+    </section>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/exceljs/dist/exceljs.min.js"></script>
+<script src="/app.js"></script>
+</body></html>
