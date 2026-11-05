@@ -5,13 +5,26 @@ let currentPage = "dashboard";
 let chatTimer = null;
 let stockItemsCache = [];
 
+let currentDraftId = null;
+let draftSaveTimer = null;
+let draftSaving = false;
+let draftSaveQueued = false;
+let draftSavePromise = null;
+let isLoadingDraft = false;
+let transactionGroupsCache = [];
+
 const api = async (url, options = {}) => {
   const res = await fetch("/api" + url, {
     credentials: "same-origin",
     ...options
   });
+
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message || "Request failed");
+
+  if (!res.ok) {
+    throw new Error(data.message || "Request failed");
+  }
+
   return data;
 };
 
@@ -21,20 +34,30 @@ const fileForm = async (form, url, method = "POST") => {
     body: new FormData(form),
     credentials: "same-origin"
   });
+
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message || "Upload failed");
+
+  if (!res.ok) {
+    throw new Error(data.message || "Upload failed");
+  }
+
   return data;
 };
 
 const toast = msg => {
   const el = $("#toast");
+
   if (!el) {
     console.log(msg);
     return;
   }
+
   el.textContent = msg;
   el.style.display = "block";
-  setTimeout(() => el.style.display = "none", 3500);
+
+  setTimeout(() => {
+    el.style.display = "none";
+  }, 3500);
 };
 
 const esc = s =>
@@ -51,13 +74,43 @@ const fmtDate = value =>
 
 const number = value => Number(value || 0);
 
-// Application boot
+const sortNewest = rows =>
+  [...(rows || [])].sort(
+    (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
+  );
+
+function resetDraftState() {
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+
+  currentDraftId = null;
+  draftSaving = false;
+  draftSaveQueued = false;
+  draftSavePromise = null;
+  isLoadingDraft = false;
+}
+
+function setDraftStatus(message, error = false) {
+  const el = $("#draftStatus");
+
+  if (!el) return;
+
+  el.textContent = message;
+  el.classList.toggle("red", error);
+  el.classList.toggle("green", !error);
+}
+
+// ---------------- APPLICATION BOOT ----------------
 
 async function boot() {
   try {
     const d = await api("/auth/me");
+
     me = d.user;
     showApp();
+
   } catch {
     me = null;
     showAuth();
@@ -67,6 +120,7 @@ async function boot() {
 function showAuth(tab = "login") {
   $("#authView").classList.remove("hidden");
   $("#appView").classList.add("hidden");
+
   $("#loginForm").classList.toggle("hidden", tab !== "login");
   $("#registerForm").classList.toggle("hidden", tab !== "register");
 
@@ -92,12 +146,17 @@ function showApp() {
 }
 
 function navigate(page) {
-  currentPage = page;
-
   if (chatTimer) {
     clearInterval(chatTimer);
     chatTimer = null;
   }
+
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+
+  currentPage = page;
 
   document.querySelectorAll(".nav").forEach(b => {
     b.classList.toggle("active", b.dataset.page === page);
@@ -109,7 +168,9 @@ function navigate(page) {
     transactions: "Transactions",
     chat: "Team Chat",
     approvals: "Approvals",
-    users: "User Management"
+    users: "User Management",
+    dashboardDetail: "Transaction Details",
+    lowStock: "Low Stock Items"
   };
 
   $("#pageTitle").textContent = titles[page] || "Dashboard";
@@ -121,44 +182,62 @@ function navigate(page) {
     transactions: transactionsPage,
     chat: chatPage,
     approvals: approvalsPage,
-    users: usersPage
+    users: usersPage,
+    dashboardDetail: dashboardDetailPage,
+    lowStock: lowStockPage
   };
 
   (pages[page] || dashboard)().catch(error => {
     console.error(error);
+
     if (currentPage !== page) return;
 
     $("#content").innerHTML = `
       <div class="panel">
         <h2>Unable to load page</h2>
         <p>${esc(error.message)}</p>
-        <button class="action" onclick="navigate('${page}')">Try Again</button>
+
+        <button class="action" onclick="navigate('${page}')">
+          Try Again
+        </button>
       </div>
     `;
+
     toast(error.message);
   });
 }
 
-// Authentication
+// ---------------- AUTHENTICATION ----------------
 
 $("#loginForm").onsubmit = async e => {
   e.preventDefault();
-  const button = e.target.querySelector('button[type="submit"], button:not([type])');
+
+  const button = e.target.querySelector(
+    'button[type="submit"], button:not([type])'
+  );
 
   try {
     if (button) button.disabled = true;
 
     const d = await api("/auth/login", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(Object.fromEntries(new FormData(e.target)))
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(
+        Object.fromEntries(new FormData(e.target))
+      )
     });
 
     me = d.user;
+
     e.target.reset();
+    resetDraftState();
     showApp();
+
   } catch (error) {
     toast(error.message);
+
   } finally {
     if (button) button.disabled = false;
   }
@@ -170,12 +249,18 @@ $("#registerForm").onsubmit = async e => {
   try {
     const d = await api("/auth/register", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(Object.fromEntries(new FormData(e.target)))
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(
+        Object.fromEntries(new FormData(e.target))
+      )
     });
+
     toast(d.message);
     e.target.reset();
     showAuth("login");
+
   } catch (error) {
     toast(error.message);
   }
@@ -183,11 +268,27 @@ $("#registerForm").onsubmit = async e => {
 
 $("#logoutBtn").onclick = async () => {
   try {
-    await api("/auth/logout", { method: "POST" });
+    if (draftSaveTimer) {
+      clearTimeout(draftSaveTimer);
+      draftSaveTimer = null;
+    }
+
+    await flushDraftSave();
+
+    await api("/auth/logout", {
+      method: "POST"
+    });
+
     me = null;
-    if (chatTimer) clearInterval(chatTimer);
+
+    if (chatTimer) {
+      clearInterval(chatTimer);
+    }
+
     chatTimer = null;
+    resetDraftState();
     showAuth();
+
   } catch (error) {
     toast(error.message);
   }
@@ -201,9 +302,12 @@ document.querySelectorAll(".nav").forEach(b => {
   b.onclick = () => navigate(b.dataset.page);
 });
 
-function stat(label, value, sub = "") {
+// ---------------- DASHBOARD CARDS ----------------
+
+function stat(label, value, sub = "", action = "") {
   return `
-    <div class="stat">
+    <div class="stat ${action ? "stat-clickable" : ""}"
+      ${action ? `role="button" tabindex="0" onclick="${action}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();${action}}"` : ""}>
       <small>${label}</small>
       <strong>${value}</strong>
       <small>${sub}</small>
@@ -211,8 +315,7 @@ function stat(label, value, sub = "") {
   `;
 }
 
-// Dashboard
-
+// ---------------- DASHBOARD ----------------
 
 async function dashboard() {
   const [items, summary, recent] = await Promise.all([
@@ -232,21 +335,46 @@ async function dashboard() {
 
   $("#content").innerHTML = `
     <div class="grid">
-      ${stat("TOTAL ITEMS", items.length)}
-      ${stat("PENDING ENTRIES", pending)}
-      ${stat("TOTAL RECEIVED", `<span class="green">+${receive}</span>`)}
-      ${stat("TOTAL DISPATCHED", `<span class="red">-${dispatch}</span>`)}
-      ${stat("LOW STOCK ITEMS", lowStock)}
+      ${stat("TOTAL ITEMS", items.length, "Open Item Master", "navigate('stock')")}
+
+      ${stat(
+        "PENDING ENTRIES",
+        pending,
+        "Open pending invoices",
+        "openDashboardDetails('pending')"
+      )}
+
+      ${stat(
+        "TOTAL RECEIVED",
+        `<span class="green">+${receive}</span>`,
+        "View RECEIVE invoices",
+        "openDashboardDetails('RECEIVE')"
+      )}
+
+      ${stat(
+        "TOTAL DISPATCHED",
+        `<span class="red">-${dispatch}</span>`,
+        "View DISPATCH invoices",
+        "openDashboardDetails('DISPATCH')"
+      )}
+
+      ${stat(
+        "LOW STOCK ITEMS",
+        lowStock,
+        "View low stock",
+        "navigate('lowStock')"
+      )}
     </div>
 
     <div class="section-head">
       <h2>Recent Transactions</h2>
+
       <button class="action" onclick="navigate('transactions')">
         View History →
       </button>
     </div>
 
-    ${txTable(recent)}
+    ${txTable(sortNewest(recent))}
 
     <div class="section-head">
       <h2>Stock Snapshot</h2>
@@ -256,10 +384,50 @@ async function dashboard() {
   `;
 }
 
+// ---------------- DASHBOARD DETAILS ----------------
 
-// Transaction table
+let dashboardDetailFilter = "pending";
+
+function openDashboardDetails(filter) {
+  dashboardDetailFilter = filter;
+  navigate("dashboardDetail");
+}
+
+async function dashboardDetailPage() {
+  const rows = await api("/transactions");
+
+  let filtered = rows || [];
+
+  if (dashboardDetailFilter === "pending") {
+    filtered = filtered.filter(t => t.status === "pending");
+  } else {
+    filtered = filtered.filter(t => t.type === dashboardDetailFilter);
+  }
+
+  $("#content").innerHTML = `
+    <div class="section-head">
+      <h2>${esc(dashboardDetailFilter)} Transactions</h2>
+
+      <button class="action" onclick="navigate('dashboard')">
+        Back to Dashboard
+      </button>
+    </div>
+
+    ${txTable(
+      filtered,
+      me?.role === "admin",
+      me?.role === "admin"
+    )}
+  `;
+}
+
+// ---------------- TRANSACTION TABLE ----------------
+
+// ---------------- TRANSACTION TABLE ----------------
 
 function txTable(rows, adminActions = false, allowDelete = false) {
+  rows = sortNewest(rows || []);
+
   if (!rows.length) {
     return `<div class="empty">No transactions found.</div>`;
   }
@@ -280,46 +448,77 @@ function txTable(rows, adminActions = false, allowDelete = false) {
             ${adminActions || allowDelete ? "<th>Action</th>" : ""}
           </tr>
         </thead>
+
         <tbody>
           ${rows.map(t => `
             <tr>
               <td>${fmtDate(t.createdAt)}</td>
+
               <td>${esc(t.invoiceNumber || "—")}</td>
+
               <td>${esc(t.item?.code || t.code || "—")}</td>
+
               <td>${esc(t.item?.name || t.name || "—")}</td>
+
               <td class="${t.type === "RECEIVE" ? "green" : "red"}">
                 ${esc(t.type)}
               </td>
+
               <td class="${t.type === "RECEIVE" ? "green" : "red"}">
                 ${t.type === "RECEIVE" ? "+" : "-"}
-                ${number(t.quantity)} ${esc(t.item?.unit || t.unit || "")}
+                ${number(t.totalQuantity ?? t.quantity)}
+                ${esc(t.item?.unit || t.unit || "")}
               </td>
+
               <td>${esc(t.createdBy?.name || "")}</td>
+
               <td>
-                <span class="badge ${esc(t.status)}">${esc(t.status)}</span>
+                <span class="badge ${esc(t.status)}">
+                  ${esc(t.status)}
+                </span>
               </td>
 
               ${adminActions || allowDelete ? `
                 <td>
-                  ${adminActions && t.status === "pending" ? `
-                    <button class="action good"
-                      onclick="reviewTx('${t.batchId || t._id}','${t.batchId ? "batch" : "single"}','approve')">
-                      Approve
-                    </button>
-                    <button class="action bad"
-                      onclick="reviewTx('${t.batchId || t._id}','${t.batchId ? "batch" : "single"}','reject')">
-                      Reject
-                    </button>
-                  ` : ""}
+                  ${
+                    adminActions && t.status === "pending"
+                      ? `
+                        <button
+                          type="button"
+                          class="action good"
+                          onclick="reviewTx('${t.batchId || t._id}','approve','${t.batchId ? "batch" : "single"}')">
+                          Approve
+                        </button>
 
-                  ${allowDelete && t.status !== "pending" ? `
-                    <button class="action bad"
-                      onclick="deleteTransaction('${t._id}','${t.batchId || ""}')">
-                      ${t.batchId ? "Delete Invoice" : "Delete Entry"}
-                    </button>
-                  ` : ""}
+                        <button
+                          type="button"
+                          class="action bad"
+                          onclick="reviewTx('${t.batchId || t._id}','reject','${t.batchId ? "batch" : "single"}')">
+                          Reject
+                        </button>
+                      `
+                      : ""
+                  }
 
-                  ${!allowDelete && !(adminActions && t.status === "pending") ? "—" : ""}
+                  ${
+                    allowDelete && t.status === "rejected"
+                      ? `
+                        <button
+                          type="button"
+                          class="action bad"
+                          onclick="deleteTransaction('${t._id}')">
+                          Delete Entry
+                        </button>
+                      `
+                      : ""
+                  }
+
+                  ${
+                    !allowDelete &&
+                    !(adminActions && t.status === "pending")
+                      ? "—"
+                      : ""
+                  }
                 </td>
               ` : ""}
             </tr>
@@ -330,7 +529,7 @@ function txTable(rows, adminActions = false, allowDelete = false) {
   `;
 }
 
-// Stock table
+// ---------------- STOCK TABLE ----------------
 
 function itemsTable(items, allowEdit = false) {
   if (!items.length) {
@@ -351,22 +550,39 @@ function itemsTable(items, allowEdit = false) {
             ${allowEdit ? "<th>Action</th>" : ""}
           </tr>
         </thead>
+
         <tbody>
           ${items.map(i => `
             <tr>
               <td>
-                ${i.image ? `<img class="item-img" src="${esc(i.image)}" alt="Item">` : ""}
+                ${i.image ? `
+                  <img class="item-img"
+                    src="${esc(i.image)}"
+                    alt="Item">
+                ` : ""}
+
                 ${esc(i.name)}
               </td>
+
               <td>${esc(i.code)}</td>
+
               <td class="green">+${number(i.received)}</td>
+
               <td class="red">-${number(i.dispatched)}</td>
-              <td><b>${number(i.stock)} ${esc(i.unit)}</b></td>
+
+              <td>
+                <b>${number(i.stock)} ${esc(i.unit)}</b>
+              </td>
+
               <td>${esc(i.createdBy?.name || "")}</td>
 
               ${allowEdit ? `
                 <td>
-                  <button class="action" onclick="editItem('${i._id}')">Edit</button>
+                  <button class="action"
+                    onclick="editItem('${i._id}')">
+                    Edit
+                  </button>
+
                   ${me?.role === "admin" ? `
                     <button class="action bad"
                       onclick="deleteItem('${i._id}')">
@@ -383,7 +599,7 @@ function itemsTable(items, allowEdit = false) {
   `;
 }
 
-// Excel helpers
+// ---------------- EXCEL HELPERS ----------------
 
 const exportColumns = [
   { key: "image", label: "IMAGE", width: 16 },
@@ -403,1739 +619,2319 @@ const exportColumns = [
 
 function excelColumnLetter(number) {
   let result = "";
+
   while (number > 0) {
     const remainder = (number - 1) % 26;
+
     result = String.fromCharCode(65 + remainder) + result;
     number = Math.floor((number - 1) / 26);
   }
+
   return result;
 }
 
 async function imageToExcelData(url) {
   const response = await fetch(url);
-  if (!response.ok) throw new Error("Image could not be loaded.");
+
+  if (!response.ok) {
+    throw new Error("Image could not be loaded.");
+  }
 
   const blob = await response.blob();
   const bitmap = await createImageBitmap(blob);
+
   const canvas = document.createElement("canvas");
+
   canvas.width = bitmap.width;
   canvas.height = bitmap.height;
+
   canvas.getContext("2d").drawImage(bitmap, 0, 0);
   bitmap.close();
 
   return canvas.toDataURL("image/png").split(",")[1];
 }
 
-function showExcelColumnPicker(items) {
-  const old = $("#excelColumnModal");
-  if (old) old.remove();
-
-  const modal = document.createElement("div");
-  modal.id = "excelColumnModal";
-  modal.style.cssText = `
-    position:fixed;inset:0;z-index:9999;background:#000b;
-    display:flex;align-items:center;justify-content:center;padding:15px;
-  `;
-
-  modal.innerHTML = `
-    <div class="panel" style="width:100%;max-width:550px;max-height:85vh;overflow:auto">
-      <h2>Choose Excel Columns</h2>
-      <p class="hint">Select the columns you want to export.</p>
-
-      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0">
-        <button type="button" class="action" id="excelSelectAll">Select All</button>
-        <button type="button" class="action" id="excelSelectNone">Clear All</button>
-      </div>
-
-      <div class="form-grid" id="excelColumnList">
-        ${exportColumns.map(c => `
-          <label style="display:flex;gap:9px;align-items:center">
-            <input type="checkbox" value="${c.key}" checked>
-            ${esc(c.label)}
-          </label>
-        `).join("")}
-      </div>
-
-      <div style="display:flex;gap:10px;margin-top:20px">
-        <button type="button" class="primary" id="excelDownload">Download Excel</button>
-        <button type="button" class="action" id="excelCancel">Cancel</button>
-      </div>
-    </div>
-  `;
-
-  document.body.appendChild(modal);
-
-  $("#excelSelectAll").onclick = () =>
-    modal.querySelectorAll('input[type="checkbox"]').forEach(x => x.checked = true);
-
-  $("#excelSelectNone").onclick = () =>
-    modal.querySelectorAll('input[type="checkbox"]').forEach(x => x.checked = false);
-
-  $("#excelCancel").onclick = () => modal.remove();
-
-  $("#excelDownload").onclick = async e => {
-    const selected = [...modal.querySelectorAll('input[type="checkbox"]:checked')]
-      .map(x => x.value);
-
-    if (!selected.length) return toast("Select at least one column.");
-
-    const button = e.currentTarget;
-    button.disabled = true;
-    button.textContent = "Preparing Excel...";
-
-    try {
-      await exportStockExcel(items, selected);
-      toast("Excel downloaded successfully.");
-      modal.remove();
-    } catch (error) {
-      toast(error.message);
-      button.disabled = false;
-      button.textContent = "Download Excel";
-    }
-  };
-}
-
-async function exportStockExcel(items, selectedKeys) {
-  if (!window.ExcelJS) throw new Error("Excel library not loaded.");
-  if (!items.length) throw new Error("No stock items available.");
-
-  const columns = exportColumns.filter(c => selectedKeys.includes(c.key));
-  const workbook = new ExcelJS.Workbook();
-  const sheet = workbook.addWorksheet("Stock Register");
-
-  sheet.columns = columns.map(c => ({
-    header: c.label,
-    key: c.key,
-    width: c.width
-  }));
-
-  sheet.getRow(1).height = 25;
-  sheet.getRow(1).font = { bold: true };
-
-  for (const item of items) {
-    const values = {
-      image: "",
-      code: item.code || "",
-      name: item.name || "",
-      received: number(item.received),
-      dispatched: number(item.dispatched),
-      stock: number(item.stock),
-      unit: item.unit || "",
-      category: item.category || "",
-      brand: item.brand || "",
-      specifications: item.specifications || "",
-      location: item.location || "",
-      minimumStock: number(item.minimumStock),
-      addedBy: item.createdBy?.name || ""
-    };
-
-    const row = sheet.addRow(values);
-    row.height = selectedKeys.includes("image") ? 65 : 22;
-
-    if (selectedKeys.includes("image") && item.image) {
-      try {
-        const base64 = await imageToExcelData(item.image);
-        const imageId = workbook.addImage({ base64, extension: "png" });
-        const imageColumn = columns.findIndex(c => c.key === "image");
-
-        sheet.addImage(imageId, {
-          tl: {
-            col: imageColumn,
-            row: row.number - 1,
-            offsetX: 5,
-            offsetY: 5
-          },
-          br: {
-            col: imageColumn + 1,
-            row: row.number,
-            offsetX: -5,
-            offsetY: -5
-          }
-        });
-      } catch (error) {
-        console.warn("Image export failed:", item.code, error);
-      }
-    }
-  }
-
-  sheet.views = [{ state: "frozen", ySplit: 1 }];
-  sheet.autoFilter = {
-    from: "A1",
-    to: `${excelColumnLetter(columns.length)}1`
-  };
-
-  const buffer = await workbook.xlsx.writeBuffer();
-  const blob = new Blob([buffer], {
-    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-  });
-
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = "JW-ST-Stock-Register.xlsx";
-  link.click();
-
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-// Stock page
+// ---------------- STOCK MANAGEMENT ----------------
 
 async function stockPage() {
   const items = await api("/items");
-  stockItemsCache = items;
+
+  stockItemsCache = items || [];
 
   $("#content").innerHTML = `
-    <div class="panel">
-      <h2>Create New Item</h2>
-      <p class="hint">Approved users can create and edit items.</p>
+    <div class="section-head">
+      <h2>Item Master</h2>
 
-      <form id="itemForm" class="form-grid">
-        <div>
-          <label>Item Code</label>
-          <input name="code" required placeholder="JW-001">
-        </div>
-
-        <div>
-          <label>Item Name</label>
-          <input name="name" required>
-        </div>
-
-        <div>
-          <label>Unit</label>
-          <select name="unit" required>
-            <option value="PCS">PCS / Pieces</option>
-            <option value="KG">KG / Kilograms</option>
-          </select>
-        </div>
-
-        <div><label>Category</label><input name="category"></div>
-        <div><label>Brand</label><input name="brand"></div>
-        <div><label>Location</label><input name="location"></div>
-
-        <div>
-          <label>Minimum Stock</label>
-          <input name="minimumStock" type="number" min="0" value="0">
-        </div>
-
-        <div><label>Description</label><input name="description"></div>
-
-        <div class="wide">
-          <label>Specifications</label>
-          <textarea name="specifications" rows="2"></textarea>
-        </div>
-
-        <div class="wide">
-          <label>Item Photo</label>
-          <input type="file" name="image" accept="image/*">
-        </div>
-
-        <div class="wide">
-          <button class="primary" type="submit">Save Item</button>
-        </div>
-      </form>
+      <button class="action good" onclick="showItemForm()">
+        + Add New Item
+      </button>
     </div>
 
-    <div class="panel" style="margin-top:18px">
-      <div class="section-head">
-        <h2>Stock Register</h2>
-        <button id="exportStockBtn" class="primary" type="button">Download Excel</button>
-      </div>
+    <div class="toolbar">
+      <input id="itemSearch"
+        placeholder="Search code / name..."
+        oninput="filterStockItems()">
 
-      <div class="form-grid">
-        <div class="wide">
-          <label>Search Code or Name</label>
-          <input id="stockSearch" placeholder="Search item...">
-        </div>
-
-        <div>
-          <label>Quantity Condition</label>
-          <select id="stockCondition">
-            <option value="all">All Quantities</option>
-            <option value="gt">Greater than</option>
-            <option value="lt">Less than</option>
-            <option value="eq">Equal to</option>
-            <option value="between">Between</option>
-          </select>
-        </div>
-
-        <div>
-          <label>Quantity Value</label>
-          <input id="stockValue" type="number" min="0">
-        </div>
-
-        <div id="stockSecondValueBox" class="hidden">
-          <label>Maximum Quantity</label>
-          <input id="stockSecondValue" type="number" min="0">
-        </div>
-
-        <div class="wide">
-          <button id="clearStockFilter" class="action" type="button">Clear Filters</button>
-        </div>
-      </div>
-
-      <p id="stockResultCount" class="hint"></p>
-      <div id="stockResults"></div>
+      <button class="action" onclick="showExcelOptions()">
+        Export Excel
+      </button>
     </div>
 
-    <div id="itemEditModal"></div>
-    <div id="itemHistoryModal"></div>
+    <div id="itemFormArea"></div>
+
+    <div id="stockTableArea">
+      ${itemsTable(items, true)}
+    </div>
   `;
-
-  const search = $("#stockSearch");
-  const condition = $("#stockCondition");
-  const value = $("#stockValue");
-  const secondValue = $("#stockSecondValue");
-  const secondBox = $("#stockSecondValueBox");
-
-  function getFilteredItems() {
-    const query = search.value.trim().toLowerCase();
-    const mode = condition.value;
-    const first = Number(value.value);
-    const second = Number(secondValue.value);
-
-    return items.filter(item => {
-      const matchesText =
-        String(item.code || "").toLowerCase().includes(query) ||
-        String(item.name || "").toLowerCase().includes(query);
-
-      const qty = number(item.stock);
-      let matchesQuantity = true;
-
-      if (mode === "gt") matchesQuantity = value.value !== "" && qty > first;
-      if (mode === "lt") matchesQuantity = value.value !== "" && qty < first;
-      if (mode === "eq") matchesQuantity = value.value !== "" && qty === first;
-
-      if (mode === "between") {
-        matchesQuantity = value.value !== "" &&
-          secondValue.value !== "" &&
-          qty >= Math.min(first, second) &&
-          qty <= Math.max(first, second);
-      }
-
-      return matchesText && matchesQuantity;
-    });
-  }
-
-  function renderStockResults() {
-    const filtered = getFilteredItems();
-    $("#stockResultCount").textContent =
-      `Showing ${filtered.length} of ${items.length} items`;
-    $("#stockResults").innerHTML = itemsTable(filtered, true);
-  }
-
-  search.addEventListener("input", renderStockResults);
-  value.addEventListener("input", renderStockResults);
-  secondValue.addEventListener("input", renderStockResults);
-
-  condition.addEventListener("change", () => {
-    secondBox.classList.toggle("hidden", condition.value !== "between");
-    renderStockResults();
-  });
-
-  $("#clearStockFilter").onclick = () => {
-    search.value = "";
-    condition.value = "all";
-    value.value = "";
-    secondValue.value = "";
-    secondBox.classList.add("hidden");
-    renderStockResults();
-  };
-
-  $("#exportStockBtn").onclick = () =>
-    showExcelColumnPicker(getFilteredItems());
-
-  renderStockResults();
-
-  $("#itemForm").onsubmit = async e => {
-    e.preventDefault();
-    const button = e.target.querySelector('button[type="submit"]');
-
-    try {
-      button.disabled = true;
-      button.textContent = "Saving...";
-
-      const d = await fileForm(e.target, "/items");
-      toast(d.message || "Item saved successfully.");
-
-      await stockPage();
-    } catch (error) {
-      toast(error.message);
-      button.disabled = false;
-      button.textContent = "Save Item";
-    }
-  };
 }
 
-// Edit item
+function filterStockItems() {
+  const q = ($("#itemSearch")?.value || "").toLowerCase();
 
-window.editItem = id => {
-  const item = stockItemsCache.find(x => String(x._id) === String(id));
-  if (!item) return toast("Item not found.");
+  const filtered = stockItemsCache.filter(i =>
+    String(i.code || "").toLowerCase().includes(q) ||
+    String(i.name || "").toLowerCase().includes(q)
+  );
 
-  const modal = $("#itemEditModal");
+  $("#stockTableArea").innerHTML = itemsTable(filtered, true);
+}
 
-  modal.innerHTML = `
-    <div style="position:fixed;inset:0;z-index:9998;background:#000b;display:flex;align-items:center;justify-content:center;padding:15px">
-      <div class="panel" style="width:100%;max-width:700px;max-height:90vh;overflow:auto">
-        <div class="section-head" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-          <div>
-            <h2>Edit Item</h2>
-            <small class="hint">${esc(item.code)} · ${esc(item.name)}</small>
-          </div>
-          <button type="button" class="action" onclick="showItemHistory('${item._id}')">
-            History ↗
-          </button>
-        </div>
+function showItemForm(item = null) {
+  const editing = Boolean(item);
 
-        ${item.image ? `
-          <img src="${esc(item.image)}"
-            style="width:90px;height:90px;object-fit:cover;border-radius:12px">
-        ` : ""}
+  $("#itemFormArea").innerHTML = `
+    <div class="panel">
+      <div class="section-head">
+        <h3>${editing ? "Edit Item" : "Create Item"}</h3>
 
-        <form id="editItemForm" class="form-grid">
-          <div>
-            <label>Item Code</label>
-            <input name="code" value="${esc(item.code)}" required>
-          </div>
-
-          <div>
-            <label>Item Name</label>
-            <input name="name" value="${esc(item.name)}" required>
-          </div>
-
-          <div>
-            <label>Unit</label>
-            <select name="unit">
-              <option value="PCS" ${item.unit === "PCS" ? "selected" : ""}>PCS</option>
-              <option value="KG" ${item.unit === "KG" ? "selected" : ""}>KG</option>
-            </select>
-          </div>
-
-          <div><label>Category</label><input name="category" value="${esc(item.category || "")}"></div>
-          <div><label>Brand</label><input name="brand" value="${esc(item.brand || "")}"></div>
-          <div><label>Location</label><input name="location" value="${esc(item.location || "")}"></div>
-
-          <div>
-            <label>Minimum Stock</label>
-            <input name="minimumStock" type="number" min="0" value="${number(item.minimumStock)}">
-          </div>
-
-          <div>
-            <label>Description</label>
-            <input name="description" value="${esc(item.description || "")}">
-          </div>
-
-          <div class="wide">
-            <label>Specifications</label>
-            <textarea name="specifications" rows="2">${esc(item.specifications || "")}</textarea>
-          </div>
-
-          <div class="wide">
-            <label>Change Item Photo</label>
-            <input name="image" type="file" accept="image/*">
-          </div>
-
-          <div class="wide" style="display:flex;gap:10px;flex-wrap:wrap">
-            <button class="primary" type="submit">Save Changes</button>
-            <button class="action" type="button" id="cancelEditItem">Cancel</button>
-          </div>
-        </form>
-      </div>
-    </div>
-  `;
-
-  $("#cancelEditItem").onclick = () => modal.innerHTML = "";
-
-  $("#editItemForm").onsubmit = async e => {
-    e.preventDefault();
-    const button = e.target.querySelector('button[type="submit"]');
-
-    try {
-      button.disabled = true;
-      button.textContent = "Updating...";
-
-      const d = await fileForm(e.target, `/items/${id}`, "PATCH");
-      modal.innerHTML = "";
-
-      toast(d.message || "Item updated successfully.");
-      await stockPage();
-    } catch (error) {
-      toast(error.message);
-      button.disabled = false;
-      button.textContent = "Save Changes";
-    }
-  };
-};
-
-// Item history
-
-window.showItemHistory = async id => {
-  const item = stockItemsCache.find(x => String(x._id) === String(id));
-  if (!item) return toast("Item not found.");
-
-  const holder = $("#itemHistoryModal");
-  if (!holder) return;
-
-  holder.innerHTML = `
-    <div style="position:fixed;inset:0;z-index:10001;background:#000c;display:flex;align-items:center;justify-content:center;padding:15px">
-      <div class="panel" style="width:100%;max-width:1000px;max-height:90vh;overflow:auto">
-        <div class="section-head">
-          <div>
-            <h2>Item History</h2>
-            <p class="hint">${esc(item.code)} · ${esc(item.name)}</p>
-          </div>
-          <button class="action" id="closeItemHistory">Close</button>
-        </div>
-
-        <div id="itemHistoryContent" class="empty">Loading item history...</div>
-      </div>
-    </div>
-  `;
-
-  $("#closeItemHistory").onclick = () => holder.innerHTML = "";
-
-  try {
-    const result = await api(`/items/${id}/history?page=1&limit=100`);
-
-    const rows = Array.isArray(result.entries) ? result.entries : [];
-    const summary = result.summary || {};
-
-    $("#itemHistoryContent").innerHTML = `
-      <div class="grid">
-        ${stat("TOTAL RECEIVED", `<span class="green">+${number(summary.received)}</span>`)}
-        ${stat("TOTAL DISPATCHED", `<span class="red">-${number(summary.dispatched)}</span>`)}
-        ${stat("CURRENT STOCK", `${number(summary.currentStock)} ${esc(item.unit)}`)}
-      </div>
-
-      <div style="display:flex;justify-content:flex-end;margin:12px 0">
-        <button class="primary" id="downloadItemHistory" ${rows.length ? "" : "disabled"}>
-          Download History Excel
+        <button class="action" onclick="$('#itemFormArea').innerHTML=''">
+          Close
         </button>
       </div>
 
-      ${rows.length ? `
-        <div class="panel table-wrap">
-          <table class="table">
-            <thead>
-              <tr>
-                <th>Date</th>
-                <th>Invoice</th>
-                <th>Type</th>
-                <th>Quantity</th>
-                <th>User</th>
-                <th>Status</th>
-                <th>Details</th>
-                ${me?.role === "admin" ? "<th>Action</th>" : ""}
-              </tr>
-            </thead>
+      <form id="itemForm" class="form-grid">
+        <input name="code"
+          placeholder="ITEM CODE"
+          value="${esc(item?.code || "")}"
+          required>
 
-            <tbody>
-              ${rows.map(t => `
-                <tr>
-                  <td>${fmtDate(t.createdAt)}</td>
-                  <td>${esc(t.invoiceNumber || "—")}</td>
-                  <td class="${t.type === "RECEIVE" ? "green" : "red"}">
-                    ${esc(t.type)}
-                  </td>
-                  <td class="${t.type === "RECEIVE" ? "green" : "red"}">
-                    ${t.type === "RECEIVE" ? "+" : "-"}
-                    ${number(t.quantity)} ${esc(item.unit)}
-                  </td>
-                  <td>${esc(t.createdBy?.name || "—")}</td>
-                  <td>
-                    <span class="badge ${esc(t.status)}">${esc(t.status)}</span>
-                  </td>
-                  <td>
-                    <button class="action"
-                      onclick="openTransactionDetails('${item._id}','${t._id}')">
-                      View
-                    </button>
-                  </td>
+        <input name="name"
+          placeholder="ITEM NAME"
+          value="${esc(item?.name || "")}"
+          required>
 
-                  ${me?.role === "admin" ? `
-                    <td>
-                      ${t.status !== "pending" ? `
-                        <button class="action bad"
-                          onclick="deleteTransaction('${t._id}','${t.batchId || ""}','${item._id}')">
-                          ${t.batchId ? "Delete Invoice" : "Delete Entry"}
-                        </button>
-                      ` : "Pending"}
-                    </td>
-                  ` : ""}
-                </tr>
-              `).join("")}
-            </tbody>
-          </table>
-        </div>
+        <input name="unit"
+          placeholder="UNIT (KG / PCS / BAG)"
+          value="${esc(item?.unit || "KG")}"
+          required>
 
-        <p class="hint">
-          Showing ${rows.length} of ${number(result.pagination?.total)} entries.
-        </p>
-      ` : `
-        <div class="empty">No transaction history found for this item.</div>
-      `}
-    `;
+        <input name="category"
+          placeholder="CATEGORY"
+          value="${esc(item?.category || "")}">
 
-    const downloadButton = $("#downloadItemHistory");
+        <input name="brand"
+          placeholder="BRAND"
+          value="${esc(item?.brand || "")}">
 
-    if (rows.length && downloadButton) {
-      downloadButton.onclick = async e => {
-        const button = e.currentTarget;
-        button.disabled = true;
-        button.textContent = "Preparing Excel...";
+        <input name="location"
+          placeholder="LOCATION"
+          value="${esc(item?.location || "")}">
 
-        try {
-          let allRows = [];
-          let page = 1;
+        <input name="minimumStock"
+          type="number"
+          min="0"
+          step="any"
+          placeholder="MINIMUM STOCK"
+          value="${esc(item?.minimumStock ?? 0)}">
 
-          const totalPages = Math.max(
-            1,
-            number(result.pagination?.totalPages)
-          );
+        <input name="image"
+          type="file"
+          accept="image/*">
 
-          while (page <= totalPages) {
-            const pageData = page === 1
-              ? result
-              : await api(`/items/${id}/history?page=${page}&limit=100`);
+        <textarea name="specifications"
+          placeholder="SPECIFICATIONS">${esc(item?.specifications || "")}</textarea>
 
-            allRows.push(...(pageData.entries || []));
-            page++;
-          }
-
-          if (!allRows.length) {
-            throw new Error("No history available to export.");
-          }
-
-          await exportItemHistoryExcel(item, allRows);
-          toast("Item history Excel downloaded.");
-        } catch (error) {
-          toast(error.message);
-        } finally {
-          button.disabled = false;
-          button.textContent = "Download History Excel";
-        }
-      };
-    }
-  } catch (error) {
-    $("#itemHistoryContent").innerHTML = `
-      <div class="empty">
-        Could not load item history.
-        <p>${esc(error.message)}</p>
-      </div>
-    `;
-  }
-};
-
-async function exportItemHistoryExcel(item, rows) {
-  if (!window.ExcelJS) throw new Error("Excel library not loaded.");
-  if (!rows.length) throw new Error("No history available to export.");
-
-  const workbook = new ExcelJS.Workbook();
-  const sheet = workbook.addWorksheet("Item History");
-
-  sheet.columns = [
-    { header: "DATE", key: "date", width: 24 },
-    { header: "INVOICE", key: "invoice", width: 18 },
-    { header: "CODE", key: "code", width: 18 },
-    { header: "NAME", key: "name", width: 28 },
-    { header: "TYPE", key: "type", width: 16 },
-    { header: "QUANTITY", key: "quantity", width: 16 },
-    { header: "UNIT", key: "unit", width: 12 },
-    { header: "USER", key: "user", width: 22 },
-    { header: "STATUS", key: "status", width: 16 },
-    { header: "NOTE", key: "note", width: 30 }
-  ];
-
-  sheet.addRows(rows.map(t => ({
-    date: fmtDate(t.createdAt),
-    invoice: t.invoiceNumber || "",
-    code: item.code,
-    name: item.name,
-    type: t.type,
-    quantity: number(t.quantity),
-    unit: item.unit,
-    user: t.createdBy?.name || "",
-    status: t.status,
-    note: t.note || ""
-  })));
-
-  sheet.getRow(1).font = { bold: true };
-  sheet.views = [{ state: "frozen", ySplit: 1 }];
-  sheet.autoFilter = {
-    from: "A1",
-    to: "J1"
-  };
-
-  const buffer = await workbook.xlsx.writeBuffer();
-  const blob = new Blob([buffer], {
-    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-  });
-
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `JW-ST-${item.code}-History.xlsx`;
-  link.click();
-
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-// Transaction details
-
-window.openTransactionDetails = async (itemId, transactionId) => {
-  try {
-    const result = await api(`/items/${itemId}/history/${transactionId}`);
-    const t = result.entry || result.transaction || result;
-
-    const old = $("#transactionDetailsModal");
-    if (old) old.remove();
-
-    const modal = document.createElement("div");
-    modal.id = "transactionDetailsModal";
-    modal.style.cssText = `
-      position:fixed;inset:0;z-index:10002;background:#000c;
-      display:flex;align-items:center;justify-content:center;padding:15px;
-    `;
-
-    modal.innerHTML = `
-      <div class="panel" style="width:100%;max-width:550px;max-height:85vh;overflow:auto">
-        <div class="section-head">
-          <h2>Transaction Details</h2>
-          <button class="action" id="closeTransactionDetails">Close</button>
-        </div>
-
-        <div class="form-grid">
-          <div><label>Item Code</label><b>${esc(result.item?.code || "—")}</b></div>
-          <div><label>Item Name</label><b>${esc(result.item?.name || "—")}</b></div>
-          <div><label>Invoice Number</label><b>${esc(t.invoiceNumber || "—")}</b></div>
-
-          <div>
-            <label>Transaction Type</label>
-            <b class="${t.type === "RECEIVE" ? "green" : "red"}">${esc(t.type)}</b>
-          </div>
-
-          <div>
-            <label>Quantity</label>
-            <b>${number(t.quantity)} ${esc(result.item?.unit || "")}</b>
-          </div>
-
-          <div>
-            <label>Status</label>
-            <span class="badge ${esc(t.status)}">${esc(t.status)}</span>
-          </div>
-
-          <div><label>Created By</label><b>${esc(t.createdBy?.name || "—")}</b></div>
-          <div><label>Date</label><b>${fmtDate(t.createdAt)}</b></div>
-          <div><label>Reviewed By</label><b>${esc(t.reviewedBy?.name || "—")}</b></div>
-          <div><label>Reviewed At</label><b>${fmtDate(t.reviewedAt)}</b></div>
-
-          <div class="wide">
-            <label>Note</label>
-            <p>${esc(t.note || "—")}</p>
-          </div>
-
-          <div class="wide">
-            <label>Rejection Reason</label>
-            <p>${esc(t.rejectionReason || "—")}</p>
-          </div>
-
-          ${t.image ? `
-            <div class="wide">
-              <label>Attached Image</label>
-              <a href="${esc(t.image)}" target="_blank" rel="noopener">
-                <img src="${esc(t.image)}" alt="Transaction attachment"
-                  style="max-width:100%;max-height:250px;object-fit:contain;border-radius:12px">
-              </a>
-            </div>
-          ` : ""}
-        </div>
-      </div>
-    `;
-
-    document.body.appendChild(modal);
-
-    $("#closeTransactionDetails").onclick = () => modal.remove();
-  } catch (error) {
-    toast(error.message || "Unable to load transaction details.");
-  }
-};
-
-// Invoice entry rows
-
-// Invoice entry rows
-
-function invoiceItemRow(index) {
-  return `
-    <div class="panel invoice-item-row" data-row="${index}"
-      style="margin:10px 0;padding:12px">
-
-      <div class="invoice-entry-grid">
-
-        <div class="invoice-image-cell">
-          <label>IMAGE</label>
-          <div class="invoice-image-preview">
-            <span class="hint">No photo</span>
-          </div>
-        </div>
-
-        <div>
-          <label>CODE</label>
-          <input class="invoice-code"
-            list="invoiceCodeOptions"
-            placeholder="Select item code"
-            autocomplete="off"
-            required>
-          <input type="hidden" class="invoice-item-id">
-        </div>
-
-        <div>
-          <label>NAME</label>
-          <input class="invoice-name"
-            placeholder="Auto-filled item name"
-            readonly
-            required>
-        </div>
-
-        <div>
-          <label>QNT</label>
-          <input class="invoice-qnt"
-            type="number" min="1" step="1"
-            placeholder="0" required>
-        </div>
-
-        <div>
-          <label>BAGS</label>
-          <input class="invoice-bags"
-            type="number" min="1" step="1"
-            value="1" required>
-        </div>
-
-        <div>
-          <label>BAG PR KG</label>
-          <input class="invoice-bag-per-kg"
-  type="number" min="0" step="0.001"
-  placeholder="0">
-        </div>
-
-        <div>
-          <label>TOT. K.G.</label>
-          <input class="invoice-total-kg"
-            type="text" value="0" readonly>
-        </div>
-
-        <div>
-          <label>TOT. QNT</label>
-          <input class="invoice-total-qnt"
-            type="text" value="0" readonly>
-        </div>
-
-        <button type="button"
-          class="action bad remove-invoice-item"
-          title="Remove item">✕ Remove</button>
-      </div>
-
-      <small class="invoice-item-info hint">
-        Select an existing item code from Item Master.
-      </small>
+        <button class="action good" type="submit">
+          ${editing ? "Update Item" : "Save Item"}
+        </button>
+      </form>
     </div>
   `;
+
+  $("#itemForm").onsubmit = async e => {
+    e.preventDefault();
+
+    try {
+      if (editing) {
+        await fileForm(
+          e.target,
+          `/items/${item._id}`,
+          "PATCH"
+        );
+      } else {
+        await fileForm(e.target, "/items");
+      }
+
+      toast(editing ? "Item updated." : "Item created.");
+
+      stockPage();
+
+    } catch (error) {
+      toast(error.message);
+    }
+  };
 }
 
-
-function addInvoiceItemRow() {
-  const holder = $("#invoiceItems");
-  if (!holder) return;
-
-  const index = holder.querySelectorAll(".invoice-item-row").length;
-
-  holder.insertAdjacentHTML("beforeend", invoiceItemRow(index));
-
-  const row = holder.lastElementChild;
-
-  const code = row.querySelector(".invoice-code");
-  const id = row.querySelector(".invoice-item-id");
-  const name = row.querySelector(".invoice-name");
-  const imageBox = row.querySelector(".invoice-image-preview");
-  const qnt = row.querySelector(".invoice-qnt");
-  const bags = row.querySelector(".invoice-bags");
-  const bagPerKg = row.querySelector(".invoice-bag-per-kg");
-  const info = row.querySelector(".invoice-item-info");
-
-  function matchExistingItem() {
-    const value = code.value.trim().toLowerCase();
-
+async function editItem(id) {
+  try {
     const item = stockItemsCache.find(i =>
-      String(i.code || "").trim().toLowerCase() === value
+      String(i._id) === String(id)
     );
 
     if (!item) {
-      id.value = "";
-      name.value = "";
-      imageBox.innerHTML = `<span class="hint">No photo</span>`;
-
-      info.textContent = value
-        ? "Item not found. First create this item in Stock & Items."
-        : "Select an existing item code from Item Master.";
-
-      info.classList.add("red");
-      updateInvoiceTotal();
+      toast("Item not found.");
       return;
     }
 
-    id.value = item._id;
-    name.value = item.name || "";
+    showItemForm(item);
 
-    if (item.image) {
-      imageBox.innerHTML = `
-        <img src="${esc(item.image)}"
-          alt="${esc(item.name || "Item")}"
-          class="invoice-item-image">
-      `;
-    } else {
-      imageBox.innerHTML = `<span class="hint">No photo</span>`;
-    }
+    $("#itemFormArea").scrollIntoView({
+      behavior: "smooth",
+      block: "start"
+    });
 
-    info.textContent =
-      `Item selected · Available stock: ${number(item.stock)} ${esc(item.unit || "")}`;
-
-    info.classList.remove("red");
-
-    updateInvoiceTotal();
+  } catch (error) {
+    toast(error.message);
   }
-
-  code.addEventListener("input", matchExistingItem);
-  code.addEventListener("change", matchExistingItem);
-  code.addEventListener("blur", matchExistingItem);
-
-  [qnt, bags, bagPerKg].forEach(input => {
-    input.addEventListener("input", updateInvoiceTotal);
-  });
-
-  row.querySelector(".remove-invoice-item").onclick = () => {
-    row.remove();
-    updateInvoiceTotal();
-  };
-
-  updateInvoiceTotal();
 }
 
+async function deleteItem(id) {
+  if (!confirm("Are you sure you want to delete this item?")) return;
 
-// Responsive invoice entry layout
+  try {
+    await api(`/items/${id}`, {
+      method: "DELETE"
+    });
 
-(function addInvoiceResponsiveStyle() {
-  if (document.getElementById("invoiceResponsiveStyle")) return;
+    toast("Item deleted.");
+    stockPage();
 
-  const style = document.createElement("style");
-  style.id = "invoiceResponsiveStyle";
+  } catch (error) {
+    toast(error.message);
+  }
+}
 
-  style.textContent = `
-    .invoice-entry-grid {
-      display: grid;
-      grid-template-columns:
-        90px
-        1fr
-        1.4fr
-        .75fr
-        .75fr
-        .9fr
-        .9fr
-        .9fr
-        auto;
-      gap: 10px;
-      align-items: end;
-    }
+// ---------------- LOW STOCK ----------------
 
-    .invoice-entry-grid > div {
-      min-width: 0;
-    }
+async function lowStockPage() {
+  const items = await api("/items");
 
-    .invoice-entry-grid label {
-      display: block;
-      margin-bottom: 6px;
-      font-size: 11px;
-      font-weight: 700;
-    }
+  const low = items.filter(i =>
+    number(i.minimumStock) > 0 &&
+    number(i.stock) <= number(i.minimumStock)
+  );
 
-    .invoice-entry-grid input {
-      width: 100%;
-      min-width: 0;
-      box-sizing: border-box;
-    }
+  $("#content").innerHTML = `
+    <div class="section-head">
+      <h2>Low Stock Items</h2>
 
-    .invoice-entry-grid input[readonly] {
-      opacity: .85;
-      cursor: not-allowed;
-    }
+      <button class="action" onclick="navigate('stock')">
+        Open Item Master
+      </button>
+    </div>
 
-    .invoice-image-preview {
-      width: 75px;
-      height: 55px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      overflow: hidden;
-      border: 1px dashed #777;
-      border-radius: 8px;
-      font-size: 10px;
-    }
+    ${itemsTable(low, true)}
+  `;
+}
 
-    .invoice-item-image {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-    }
+// ---------------- EXCEL EXPORT ----------------
 
-    .invoice-item-info {
-      display: block;
-      margin-top: 10px;
-    }
+function showExcelOptions() {
+  const old = $("#excelOptions");
 
-    @media (max-width: 1100px) {
-      .invoice-entry-grid {
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-      }
+  if (old) old.remove();
 
-      .invoice-image-cell {
-        grid-row: span 2;
-      }
-    }
+  const panel = document.createElement("div");
 
-    @media (max-width: 650px) {
-      .invoice-entry-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
+  panel.id = "excelOptions";
+  panel.className = "panel";
 
-      .invoice-image-cell {
-        grid-row: auto;
-      }
+  panel.innerHTML = `
+    <h3>Select Excel Columns</h3>
 
-      .invoice-entry-grid .remove-invoice-item {
-        grid-column: 1 / -1;
-        width: 100%;
-      }
-    }
+    <div class="form-grid">
+      ${exportColumns.map(c => `
+        <label>
+          <input type="checkbox"
+            class="excel-column"
+            value="${c.key}"
+            checked>
+          ${c.label}
+        </label>
+      `).join("")}
+    </div>
+
+    <button class="action good" onclick="exportStockExcel()">
+      Download Excel
+    </button>
   `;
 
-  document.head.appendChild(style);
-})();
+  $("#content").prepend(panel);
+}
 
-function updateInvoiceTotal() {
-  const rows = [...document.querySelectorAll(".invoice-item-row")];
-
-  let invoiceTotalQnt = 0;
-  let invoiceTotalKg = 0;
-
-  rows.forEach(row => {
-    const qnt = Number(row.querySelector(".invoice-qnt")?.value || 0);
-    const bags = Number(row.querySelector(".invoice-bags")?.value || 0);
-    const bagPerKgInput = row.querySelector(".invoice-bag-per-kg").value.trim();
-const bagPerKg = bagPerKgInput === "" ? 0 : Number(bagPerKgInput);
-    const totalQnt = qnt * bags;
-    const totalKg = bags * bagPerKg;
-
-    row.querySelector(".invoice-total-qnt").value =
-      Number.isFinite(totalQnt) ? totalQnt : 0;
-
-    row.querySelector(".invoice-total-kg").value =
-      Number.isFinite(totalKg) ? Number(totalKg.toFixed(3)) : 0;
-
-    if (Number.isSafeInteger(totalQnt) && totalQnt > 0) {
-      invoiceTotalQnt += totalQnt;
+async function exportStockExcel() {
+  try {
+    if (!window.XLSX) {
+      throw new Error("Excel library is not loaded in HTML.");
     }
 
-    if (Number.isFinite(totalKg) && totalKg >= 0) {
-      invoiceTotalKg += totalKg;
+    const selected = [
+      ...document.querySelectorAll(".excel-column:checked")
+    ].map(x => x.value);
+
+    if (!selected.length) {
+      throw new Error("Select at least one column.");
     }
-  });
 
-  const output = $("#invoiceTotal");
+    const items = await api("/items");
 
-  if (output) {
-    output.textContent =
-      `${rows.length} item lines · Total Quantity: ${invoiceTotalQnt} · Total KG: ${invoiceTotalKg.toFixed(3)}`;
+    const columns = exportColumns.filter(c =>
+      selected.includes(c.key)
+    );
+
+    const rows = items.map(item => {
+      const row = {};
+
+      columns.forEach(c => {
+        if (c.key === "addedBy") {
+          row[c.label] = item.createdBy?.name || "";
+        } else {
+          row[c.label] = item[c.key] ?? "";
+        }
+      });
+
+      return row;
+    });
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+
+    ws["!cols"] = columns.map(c => ({
+      wch: c.width
+    }));
+
+    const wb = XLSX.utils.book_new();
+
+    XLSX.utils.book_append_sheet(
+      wb,
+      ws,
+      "Stock Register"
+    );
+
+    XLSX.writeFile(
+      wb,
+      `JW-ST-Stock-${new Date().toISOString().slice(0, 10)}.xlsx`
+    );
+
+    toast("Excel downloaded.");
+
+  } catch (error) {
+    toast(error.message);
   }
 }
 
-// Transactions page
+async function exportItemHistory(itemId) {
+  try {
+    if (!window.XLSX) {
+      throw new Error("Excel library is not loaded in HTML.");
+    }
+
+    const rows = await api(
+      `/transactions?itemId=${encodeURIComponent(itemId)}`
+    );
+
+    const sorted = sortNewest(rows);
+
+    const data = sorted.map(t => ({
+      DATE: fmtDate(t.createdAt),
+      INVOICE: t.invoiceNumber || "",
+      CODE: t.item?.code || "",
+      NAME: t.item?.name || "",
+      TYPE: t.type,
+      QNT: t.qnt ?? "",
+      BAGS: t.bags ?? "",
+      "BAG PR KG": t.bagPerKg ?? "",
+      "TOTAL KG": t.totalKg ?? "",
+      "TOTAL QNT": t.totalQuantity ?? t.quantity ?? "",
+      STATUS: t.status,
+      USER: t.createdBy?.name || ""
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+
+    XLSX.utils.book_append_sheet(wb, ws, "Item History");
+
+    XLSX.writeFile(wb, `JW-ST-Item-History-${itemId}.xlsx`);
+
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+// ---------------- INVOICE HELPERS ----------------
+
+function invoiceRows() {
+  return [...document.querySelectorAll(".invoice-row")];
+}
+
+function invoicePayload() {
+  const rows = invoiceRows();
+
+  return {
+    type: $("#invoiceType")?.value || "RECEIVE",
+
+    invoiceNumber: $("#invoiceNumber")?.value || "",
+
+    // FIX: Backend expects invoiceDate
+    invoiceDate: $("#invoiceDate")?.value || "",
+
+    note: $("#invoiceNote")?.value || "",
+
+    items: rows.map(row => ({
+      itemId: row.querySelector(".invoice-item-id")?.value || null,
+
+      code: row.querySelector(".invoice-code")?.value || "",
+
+      name: row.querySelector(".invoice-name")?.value || "",
+
+      qnt: row.querySelector(".invoice-qnt")?.value ?? "",
+
+      bags: row.querySelector(".invoice-bags")?.value ?? "",
+
+      bagPerKg: row.querySelector(".invoice-bag-kg")?.value ?? "",
+
+      totalQuantity:
+        row.querySelector(".invoice-total-qnt")?.value ?? "",
+
+      totalKg:
+        row.querySelector(".invoice-total-kg")?.value ?? "",
+
+      manualTotalQuantity:
+        row.querySelector(".invoice-total-qnt")?.dataset.manual === "true",
+
+      manualTotalKg:
+        row.querySelector(".invoice-total-kg")?.dataset.manual === "true"
+    }))
+  };
+}
+
+function calculateInvoiceRow(row) {
+  const qnt = number(
+    row.querySelector(".invoice-qnt")?.value
+  );
+
+  const bags = number(
+    row.querySelector(".invoice-bags")?.value
+  );
+
+  const bagKg = number(
+    row.querySelector(".invoice-bag-kg")?.value
+  );
+
+  const totalQnt = row.querySelector(".invoice-total-qnt");
+  const totalKg = row.querySelector(".invoice-total-kg");
+
+  if (totalQnt && totalQnt.dataset.manual !== "true") {
+    totalQnt.value = qnt && bags ? qnt * bags : "";
+  }
+
+  if (totalKg && totalKg.dataset.manual !== "true") {
+    totalKg.value = bags ? bags * bagKg : "";
+  }
+
+  updateInvoiceGrandTotal();
+}
+
+function updateInvoiceTotal() {
+  invoiceRows().forEach(calculateInvoiceRow);
+}
+
+function updateInvoiceGrandTotal() {
+  const rows = invoiceRows();
+
+  const totalQnt = rows.reduce((sum, row) =>
+    sum + number(
+      row.querySelector(".invoice-total-qnt")?.value
+    ), 0
+  );
+
+  const totalKg = rows.reduce((sum, row) =>
+    sum + number(
+      row.querySelector(".invoice-total-kg")?.value
+    ), 0
+  );
+
+  const qntEl = $("#invoiceGrandQnt");
+  const kgEl = $("#invoiceGrandKg");
+
+  if (qntEl) {
+    qntEl.textContent = totalQnt.toLocaleString();
+  }
+
+  if (kgEl) {
+    kgEl.textContent = totalKg.toLocaleString();
+  }
+}
+
+function resetManualTotal(input) {
+  if (!input) return;
+
+  input.dataset.manual = "false";
+
+  const row = input.closest(".invoice-row");
+
+  if (row) {
+    calculateInvoiceRow(row);
+  }
+
+  scheduleDraftSave();
+}
+
+function addInvoiceItemRow(data = {}) {
+  const container = document.getElementById("invoiceItems");
+
+  if (!container) {
+    console.error("Missing HTML element: #invoiceItems");
+    return;
+  }
+
+  const row = document.createElement("div");
+  row.className = "invoice-row";
+
+  const selectedItem = stockItemsCache.find(i =>
+    String(i._id) === String(data.itemId || "") ||
+    String(i.code || "").toLowerCase() ===
+      String(data.code || "").toLowerCase()
+  );
+
+  row.innerHTML = `
+    <input type="hidden"
+      class="invoice-item-id"
+      value="${esc(selectedItem?._id || data.itemId || "")}">
+
+    <div class="invoice-field">
+      <label>IMAGE</label>
+      <div class="invoice-image-preview">
+        ${selectedItem?.image || data.image
+          ? `<img src="${esc(selectedItem?.image || data.image)}" alt="Item">`
+          : "No Image"}
+      </div>
+    </div>
+
+    <div class="invoice-field">
+      <label>CODE</label>
+      <input class="invoice-code"
+        list="itemCodeOptions"
+        value="${esc(data.code || selectedItem?.code || "")}"
+        placeholder="CODE">
+    </div>
+
+    <div class="invoice-field">
+      <label>NAME</label>
+      <input class="invoice-name"
+        value="${esc(data.name || selectedItem?.name || "")}"
+        placeholder="NAME">
+    </div>
+
+    <div class="invoice-field">
+      <label>QNT</label>
+      <input class="invoice-qnt"
+        type="number" min="1" step="1"
+        value="${esc(data.qnt ?? "")}"
+        placeholder="QNT">
+    </div>
+
+    <div class="invoice-field">
+      <label>BAGS</label>
+      <input class="invoice-bags"
+        type="number" min="1" step="1"
+        value="${esc(data.bags ?? "")}"
+        placeholder="BAGS">
+    </div>
+
+    <div class="invoice-field">
+      <label>BAG PR KG</label>
+      <input class="invoice-bag-kg"
+        type="number" min="0" step="any"
+        value="${esc(data.bagPerKg ?? "")}"
+        placeholder="BAG PR KG">
+    </div>
+
+    <div class="invoice-field">
+      <label>TOT. K.G.</label>
+      <input class="invoice-total-kg"
+        type="number" min="0" step="any"
+        value="${esc(data.totalKg ?? "")}"
+        data-manual="${data.manualTotalKg ? "true" : "false"}"
+        placeholder="TOTAL KG">
+
+      <button type="button" class="action"
+        onclick="resetManualTotal(this.closest('.invoice-field').querySelector('.invoice-total-kg'))">
+        Auto
+      </button>
+    </div>
+
+    <div class="invoice-field">
+      <label>TOT. QNT</label>
+      <input class="invoice-total-qnt"
+        type="number" min="1" step="1"
+        value="${esc(data.totalQuantity ?? data.quantity ?? "")}"
+        data-manual="${data.manualTotalQuantity ? "true" : "false"}"
+        placeholder="TOTAL QNT">
+
+      <button type="button" class="action"
+        onclick="resetManualTotal(this.closest('.invoice-field').querySelector('.invoice-total-qnt'))">
+        Auto
+      </button>
+    </div>
+
+    <button type="button" class="action bad remove-invoice-row">
+      Remove
+    </button>
+  `;
+
+  container.appendChild(row);
+
+  const codeInput = row.querySelector(".invoice-code");
+  const itemIdInput = row.querySelector(".invoice-item-id");
+  const nameInput = row.querySelector(".invoice-name");
+  const preview = row.querySelector(".invoice-image-preview");
+
+  // Confirm all required elements exist before attaching events.
+  if (!codeInput || !itemIdInput || !nameInput || !preview) {
+    console.error("Invoice row HTML is incomplete:", row.innerHTML);
+    row.remove();
+    toast("Invoice row could not be created. Check invoice HTML.");
+    return;
+  }
+
+  // Remove row
+  row.querySelector(".remove-invoice-row").addEventListener("click", () => {
+    row.remove();
+    updateInvoiceGrandTotal();
+    scheduleDraftSave();
+  });
+
+  // Enter key navigation
+  row.querySelectorAll("input:not([type=hidden])").forEach((input, index, inputs) => {
+    input.addEventListener("keydown", e => {
+      if (e.key !== "Enter") return;
+
+      e.preventDefault();
+
+      if (index < inputs.length - 1) {
+        inputs[index + 1].focus();
+      } else {
+        addInvoiceRow();
+        const nextRow = invoiceRows().at(-1);
+        nextRow?.querySelector(".invoice-code")?.focus();
+      }
+    });
+  });
+
+  // Item code selection
+  codeInput.addEventListener("change", () => {
+    const code = codeInput.value.trim().toLowerCase();
+
+    const item = stockItemsCache.find(i =>
+      String(i.code || "").toLowerCase() === code
+    );
+
+    if (!item) {
+      itemIdInput.value = "";
+      nameInput.value = "";
+      preview.textContent = "No Image";
+      scheduleDraftSave();
+      return;
+    }
+
+    itemIdInput.value = item._id;
+    nameInput.value = item.name || "";
+
+    preview.innerHTML = item.image
+      ? `<img src="${esc(item.image)}" alt="Item">`
+      : "No Image";
+
+    scheduleDraftSave();
+  });
+
+  // Calculations and autosave
+  row.querySelectorAll("input").forEach(input => {
+    input.addEventListener("input", () => {
+      if (
+        input.classList.contains("invoice-total-qnt") ||
+        input.classList.contains("invoice-total-kg")
+      ) {
+        input.dataset.manual = "true";
+        updateInvoiceGrandTotal();
+      } else {
+        calculateInvoiceRow(row);
+      }
+
+      scheduleDraftSave();
+    });
+
+    input.addEventListener("change", scheduleDraftSave);
+  });
+
+  calculateInvoiceRow(row);
+  updateInvoiceGrandTotal();
+}
+
+
+function removeInvoiceRow(button) {
+  const row = button.closest(".invoice-row");
+
+  if (row) {
+    row.remove();
+  }
+
+  updateInvoiceGrandTotal();
+  scheduleDraftSave();
+}
+
+// ---------------- DRAFT MANAGEMENT ----------------
+
+function scheduleDraftSave() {
+  if (isLoadingDraft || currentPage !== "transactions") {
+    return;
+  }
+
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+  }
+
+  setDraftStatus("Unsaved changes...");
+
+  draftSaveTimer = setTimeout(() => {
+    draftSaveTimer = null;
+
+    saveDraft(false).catch(error => {
+      console.error("Draft autosave error:", error);
+    });
+
+  }, 800);
+}
+
+/*
+  Reliable save queue:
+  - One save request at a time.
+  - If changes happen during saving, another save runs.
+  - flushDraftSave waits for all queued saves.
+*/
+
+async function saveDraft(showMessage = true) {
+  if (isLoadingDraft || currentPage !== "transactions") {
+    return;
+  }
+
+  const form = $("#invoiceForm");
+
+  if (!form) return;
+
+  if (!invoiceRows().length) {
+    if (showMessage) {
+      toast("Add at least one invoice row.");
+    }
+
+    return;
+  }
+
+  if (draftSaving) {
+    draftSaveQueued = true;
+
+    if (draftSavePromise) {
+      await draftSavePromise;
+    }
+
+    return;
+  }
+
+  draftSaving = true;
+
+  draftSavePromise = (async () => {
+
+    let shouldReloadList = false;
+
+    try {
+      do {
+        draftSaveQueued = false;
+
+        const payload = invoicePayload();
+
+        setDraftStatus("Saving draft...");
+
+        const wasNewDraft = !currentDraftId;
+
+        const result = currentDraftId
+          ? await api(`/drafts/${currentDraftId}`, {
+              method: "PATCH",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify(payload)
+            })
+          : await api("/drafts", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify(payload)
+            });
+
+        const savedId =
+          result.draft?._id ||
+          result._id ||
+          currentDraftId;
+
+        if (savedId) {
+          currentDraftId = savedId;
+        }
+
+        if (wasNewDraft) {
+          shouldReloadList = true;
+        }
+
+        setDraftStatus(
+          "Draft saved · " +
+          new Date().toLocaleTimeString()
+        );
+
+      } while (draftSaveQueued);
+
+      if (showMessage) {
+        toast("Draft saved.");
+      }
+
+    } catch (error) {
+      setDraftStatus("Draft save failed", true);
+
+      if (showMessage) {
+        toast(error.message);
+      }
+
+      throw error;
+
+    } finally {
+      draftSaving = false;
+      draftSaveQueued = false;
+      draftSavePromise = null;
+    }
+
+    // Only reload list when a new draft is created.
+    if (
+      shouldReloadList &&
+      currentPage === "transactions"
+    ) {
+      await loadDraftList();
+    }
+
+  })();
+
+  return draftSavePromise;
+}
+
+async function flushDraftSave() {
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+
+  if (
+    !$("#invoiceForm") ||
+    currentPage !== "transactions"
+  ) {
+    return;
+  }
+
+  if (draftSaving && draftSavePromise) {
+    await draftSavePromise;
+
+    if (draftSaveQueued) {
+      await saveDraft(false);
+    }
+
+    return;
+  }
+
+  await saveDraft(false);
+}
+
+// ---------------- LOAD DRAFT LIST ----------------
+
+async function loadDraftList() {
+  const area = $("#draftList");
+
+  if (!area) return;
+
+  try {
+    const drafts = await api("/drafts");
+
+    // Prevent old response from updating a different page.
+    if (!$("#draftList")) return;
+
+    if (!drafts.length) {
+      area.innerHTML = `
+        <div class="empty">
+          No saved drafts.
+        </div>
+      `;
+
+      return;
+    }
+
+    area.innerHTML = `
+      <div class="draft-list">
+
+        ${sortNewest(drafts).map(d => `
+          <div class="draft-card">
+
+            <div>
+              <b>
+                ${esc(d.invoiceNumber || "Untitled Draft")}
+              </b>
+
+              <small>
+                ${esc(d.type)} · ${fmtDate(d.updatedAt)}
+              </small>
+            </div>
+
+            <button class="action"
+              onclick="openDraft('${d._id}')">
+              Open
+            </button>
+
+            <button class="action bad"
+              onclick="deleteDraft('${d._id}')">
+              Delete
+            </button>
+
+          </div>
+        `).join("")}
+
+      </div>
+    `;
+
+  } catch (error) {
+    area.innerHTML = `
+      <div class="empty">
+        ${esc(error.message)}
+      </div>
+    `;
+  }
+}
+
+// ---------------- OPEN DRAFT ----------------
+
+async function openDraft(id) {
+  try {
+
+    // Save the current draft before switching.
+    if (
+      currentDraftId &&
+      String(currentDraftId) !== String(id) &&
+      $("#invoiceForm")
+    ) {
+      await flushDraftSave();
+    }
+
+    const result = await api(`/drafts/${id}`);
+
+    const draft = result.draft || result;
+
+    isLoadingDraft = true;
+
+    currentDraftId = draft._id;
+
+    $("#invoiceType").value =
+      draft.type || "RECEIVE";
+
+    $("#invoiceNumber").value =
+      draft.invoiceNumber || "";
+
+    // FIX: Read invoiceDate, with old date fallback.
+    const savedDate = draft.invoiceDate || draft.date;
+
+    $("#invoiceDate").value = savedDate
+      ? String(savedDate).slice(0, 10)
+      : "";
+
+    $("#invoiceNote").value =
+      draft.note || "";
+
+    $("#invoiceItems").innerHTML = "";
+
+    (draft.items || []).forEach(item => {
+      addInvoiceItemRow(item);
+    });
+
+    if (!draft.items?.length) {
+      addInvoiceItemRow();
+    }
+
+    updateInvoiceGrandTotal();
+
+    isLoadingDraft = false;
+
+    setDraftStatus("Draft loaded.");
+
+    toast("Draft opened.");
+
+  } catch (error) {
+
+    isLoadingDraft = false;
+
+    toast(error.message);
+  }
+}
+
+// ---------------- DELETE DRAFT ----------------
+
+async function deleteDraft(id) {
+  if (!confirm("Delete this saved draft?")) {
+    return;
+  }
+
+  try {
+    await api(`/drafts/${id}`, {
+      method: "DELETE"
+    });
+
+    if (
+      String(currentDraftId) === String(id)
+    ) {
+      currentDraftId = null;
+
+      setDraftStatus("New invoice");
+    }
+
+    toast("Draft deleted.");
+
+    await loadDraftList();
+
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+// ---------------- CLEAR INVOICE FORM ----------------
+
+function clearInvoiceForm() {
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+
+  $("#invoiceForm")?.reset();
+
+  $("#invoiceItems").innerHTML = "";
+
+  currentDraftId = null;
+
+  addInvoiceRow();
+
+  updateInvoiceGrandTotal();
+
+  setDraftStatus("New invoice");
+}
+
+// ---------------- INVOICE ROW ALIAS ----------------
+
+function addInvoiceRow(data = {}) {
+  addInvoiceItemRow(data);
+}
+
+// ---------------- INVOICE PAGE ----------------
 
 async function transactionsPage() {
-  const [items, tx] = await Promise.all([
+  const [items, transactions] = await Promise.all([
     api("/items"),
     api("/transactions")
   ]);
 
-  stockItemsCache = items;
+  stockItemsCache = items || [];
+
+  const today = new Date().toISOString().slice(0, 10);
 
   $("#content").innerHTML = `
+    <div class="section-head">
+      <h2>New Invoice Entry</h2>
+
+      <span id="draftStatus" class="draft-status">
+        New invoice
+      </span>
+    </div>
+
     <div class="panel">
-      <h2>Stock Entry / Invoice</h2>
-      <p class="hint">
-      First create items in Stock & Items. Select an existing CODE here. IMAGE and NAME will fill automatically when available.
-      </p>
+      <form id="invoiceForm">
 
-      <form id="invoiceForm" class="form-grid">
-        <div>
-          <label>Invoice Number</label>
-          <input name="invoiceNumber" placeholder="Example: 31">
+        <div class="form-grid">
+
+          <div>
+            <label>TRANSACTION TYPE</label>
+
+            <select id="invoiceType" name="type">
+              <option value="RECEIVE">RECEIVE</option>
+              <option value="DISPATCH">DISPATCH</option>
+            </select>
+          </div>
+
+          <div>
+            <label>INVOICE NUMBER</label>
+
+            <input id="invoiceNumber"
+              name="invoiceNumber"
+              placeholder="Invoice Number">
+          </div>
+
+          <div>
+            <label>DATE</label>
+
+            <input id="invoiceDate"
+              name="invoiceDate"
+              type="date"
+              value="${today}">
+          </div>
+
+          <div>
+            <label>NOTE</label>
+
+            <input id="invoiceNote"
+              name="note"
+              placeholder="Remarks">
+          </div>
+
+          <div>
+            <label>INVOICE ATTACHMENT</label>
+
+            <input id="invoiceAttachment"
+              name="image"
+              type="file"
+              accept="image/*">
+          </div>
+
         </div>
 
-        <div>
-          <label>Invoice Date</label>
-          <input name="invoiceDate" type="date">
+        <datalist id="itemCodeOptions">
+          ${items.map(i => `
+            <option value="${esc(i.code)}">
+              ${esc(i.name)}
+            </option>
+          `).join("")}
+        </datalist>
+
+        <div class="section-head">
+          <h3>Invoice Items</h3>
+
+          <button type="button"
+            class="action"
+            onclick="addInvoiceRow()">
+            + Add Row
+          </button>
         </div>
 
-        <div>
-          <label>Transaction Type</label>
-          <select name="type" required>
-            <option value="RECEIVE">RECEIVE</option>
-            <option value="DISPATCH">DISPATCH</option>
-          </select>
+        <div id="invoiceItems"></div>
+
+        <div class="invoice-grand-total">
+          <b>
+            Total Quantity:
+            <span id="invoiceGrandQnt">0</span>
+          </b>
+
+          <b>
+            Total KG:
+            <span id="invoiceGrandKg">0</span>
+          </b>
         </div>
 
-        <div>
-          <label>Reference / Note</label>
-          <input name="note" placeholder="Invoice, challan, reason...">
-        </div>
+        <div class="toolbar">
 
-        <div class="wide">
-          <label>Invoice Items</label>
-
-          <datalist id="invoiceCodeOptions">
-            ${items.map(i => `
-              <option value="${esc(i.code)}"></option>
-            `).join("")}
-          </datalist>
-
-          <div id="invoiceItems"></div>
-
-          <button type="button" id="addInvoiceItem" class="action">
-            + Add Another Item
+          <button type="button"
+            class="action"
+            onclick="saveDraft(true)">
+            Save Draft
           </button>
 
-          <p id="invoiceTotal" class="hint">
-            0 item lines · Total Quantity: 0 · Total KG: 0.000
-          </p>
-        </div>
-
-        <div class="wide">
-          <label>Attach Invoice / Photo (optional)</label>
-          <input type="file" name="image" accept="image/*">
-        </div>
-
-        <div class="wide">
-          <button type="submit" class="primary">
-            Submit Invoice for Approval
+          <button type="button"
+            class="action"
+            onclick="clearInvoiceForm()">
+            New Invoice
           </button>
+
+          <button type="submit"
+            class="action good">
+            Submit Invoice
+          </button>
+
         </div>
+
       </form>
     </div>
 
-    <div class="section-head">
-      <h2>Full Transaction History</h2>
+    <div class="panel">
+      <div class="section-head">
+        <h3>Saved Drafts</h3>
+
+        <button class="action"
+          onclick="loadDraftList()">
+          Refresh
+        </button>
+      </div>
+
+      <div id="draftList">
+        Loading drafts...
+      </div>
     </div>
 
-    ${txTable(tx, false, me?.role === "admin")}
+    <div class="section-head">
+      <h2>Transaction History</h2>
+    </div>
+
+    <div class="toolbar">
+
+      <input id="transactionSearch"
+        placeholder="Search invoice / item / code..."
+        oninput="filterTransactionHistory()">
+
+      <select id="transactionFilter"
+        onchange="filterTransactionHistory()">
+
+        <option value="ALL">
+          All Transactions
+        </option>
+
+        <option value="RECEIVE">
+          RECEIVE
+        </option>
+
+        <option value="DISPATCH">
+          DISPATCH
+        </option>
+
+        <option value="pending">
+          Pending
+        </option>
+
+        <option value="approved">
+          Approved
+        </option>
+
+        <option value="rejected">
+          Rejected
+        </option>
+
+      </select>
+
+    </div>
+
+    <div id="transactionHistory"></div>
   `;
 
-  $("#addInvoiceItem").onclick = () => {
-    addInvoiceItemRow();
+  addInvoiceRow();
 
-    const rows = document.querySelectorAll(".invoice-item-row");
-    rows[rows.length - 1]?.querySelector(".invoice-code")?.focus();
-  };
+  transactionGroupsCache = transactions || [];
 
-  // Start with one invoice row
-  addInvoiceItemRow();
+  const invoiceForm = $("#invoiceForm");
 
-  // Enter inside an invoice row adds the next row.
-  $("#invoiceForm").addEventListener("keydown", e => {
-    if (e.key !== "Enter") return;
+  invoiceForm.addEventListener(
+    "input",
+    scheduleDraftSave
+  );
+
+  invoiceForm.addEventListener(
+    "change",
+    scheduleDraftSave
+  );
+
+  invoiceForm.onsubmit = submitInvoice;
+
+  // Prevent accidental submission when pressing Enter.
+  invoiceForm.addEventListener("keydown", e => {
 
     if (
-      e.target.tagName === "TEXTAREA" ||
-      e.target.tagName === "BUTTON"
+      e.key !== "Enter" ||
+      e.defaultPrevented
     ) {
       return;
     }
 
-    e.preventDefault();
+    const target = e.target;
 
-    if (e.target.closest(".invoice-item-row")) {
-      addInvoiceItemRow();
+    if (
+      target.matches(
+        'input:not([type="file"]):not([type="hidden"]), select'
+      )
+    ) {
+      e.preventDefault();
 
-      const rows = document.querySelectorAll(".invoice-item-row");
-      rows[rows.length - 1]?.querySelector(".invoice-code")?.focus();
+      if (!target.closest(".invoice-row")) {
+        $("#invoiceItems .invoice-code")?.focus();
+      }
     }
   });
 
-  $("#invoiceForm").onsubmit = async e => {
-    e.preventDefault();
+  $("#invoiceType").addEventListener(
+    "change",
+    scheduleDraftSave
+  );
 
-    const form = e.target;
-    const button = form.querySelector('button[type="submit"]');
-    const rows = [...form.querySelectorAll(".invoice-item-row")];
+  $("#invoiceNumber").addEventListener(
+    "input",
+    scheduleDraftSave
+  );
 
-    if (!rows.length) {
-      toast("Add at least one invoice item.");
-      return;
-    }
+  $("#invoiceDate").addEventListener(
+    "change",
+    scheduleDraftSave
+  );
 
-    const selectedItems = [];
-    const missingKgItems = [];
+  $("#invoiceNote").addEventListener(
+    "input",
+    scheduleDraftSave
+  );
 
-    for (const row of rows) {
-      const itemId = row.querySelector(".invoice-item-id").value;
-      const code = row.querySelector(".invoice-code").value.trim();
+  renderTransactionHistory(transactionGroupsCache);
 
-      const qnt = Number(row.querySelector(".invoice-qnt").value);
-      const bags = Number(row.querySelector(".invoice-bags").value);
-      const bagPerKgInput =
-  row.querySelector(".invoice-bag-per-kg").value.trim();
+  await loadDraftList();
+}
 
-const bagPerKg =
-  bagPerKgInput === "" ? 0 : Number(bagPerKgInput);
+// ---------------- INVOICE VALIDATION ----------------
 
-      const item = stockItemsCache.find(x =>
-        String(x._id) === String(itemId)
+function validateInvoice() {
+  const rows = invoiceRows();
+
+  if (!rows.length) {
+    throw new Error("Add at least one item.");
+  }
+
+  const entries = [];
+
+  rows.forEach((row, index) => {
+
+    const itemId =
+      row.querySelector(".invoice-item-id").value;
+
+    const item = stockItemsCache.find(i =>
+      String(i._id) === String(itemId)
+    );
+
+    if (!item) {
+      throw new Error(
+        `Row ${index + 1}: Select a valid Item Master item.`
       );
+    }
 
-      if (!itemId || !item || !code) {
-        toast("Select a valid existing item code from Item Master in every row.");
-        return;
+    const qnt = Number(
+      row.querySelector(".invoice-qnt").value
+    );
+
+    const bags = Number(
+      row.querySelector(".invoice-bags").value
+    );
+
+    const bagPerKg = Number(
+      row.querySelector(".invoice-bag-kg").value || 0
+    );
+
+    const totalQuantityInput =
+      row.querySelector(".invoice-total-qnt");
+
+    const totalKgInput =
+      row.querySelector(".invoice-total-kg");
+
+    const totalQuantity =
+      Number(totalQuantityInput.value);
+
+    const totalKg =
+      Number(totalKgInput.value);
+
+    if (!Number.isInteger(qnt) || qnt < 1) {
+      throw new Error(
+        `Row ${index + 1}: QNT must be a positive whole number.`
+      );
+    }
+
+    if (!Number.isInteger(bags) || bags < 1) {
+      throw new Error(
+        `Row ${index + 1}: BAGS must be a positive whole number.`
+      );
+    }
+
+    if (
+      !Number.isFinite(bagPerKg) ||
+      bagPerKg < 0
+    ) {
+      throw new Error(
+        `Row ${index + 1}: BAG PR KG cannot be negative.`
+      );
+    }
+
+    if (
+      !Number.isInteger(totalQuantity) ||
+      totalQuantity < 1
+    ) {
+      throw new Error(
+        `Row ${index + 1}: TOT.QNT must be a positive whole number.`
+      );
+    }
+
+    if (
+      !Number.isFinite(totalKg) ||
+      totalKg < 0
+    ) {
+      throw new Error(
+        `Row ${index + 1}: TOT.KG must be zero or greater.`
+      );
+    }
+
+    entries.push({
+      itemId,
+
+      code: item.code,
+
+      name: item.name,
+
+      qnt,
+
+      bags,
+
+      bagPerKg,
+
+      totalQuantity,
+
+      totalKg,
+
+      manualTotalQuantity:
+        totalQuantityInput.dataset.manual === "true",
+
+      manualTotalKg:
+        totalKgInput.dataset.manual === "true"
+    });
+  });
+
+  return entries;
+}
+
+// ---------------- SUBMIT INVOICE ----------------
+
+let invoiceSubmitting = false;
+
+async function submitInvoice(e) {
+  e.preventDefault();
+
+  if (invoiceSubmitting) {
+    return;
+  }
+
+  const button = e.target.querySelector(
+    'button[type="submit"]'
+  );
+
+  invoiceSubmitting = true;
+
+  try {
+
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Submitting...";
+    }
+
+    // Finish pending draft saves first.
+    await flushDraftSave();
+
+    const entries = validateInvoice();
+
+    const formData = new FormData();
+
+    formData.append(
+      "type",
+      $("#invoiceType").value
+    );
+
+    formData.append(
+      "invoiceNumber",
+      $("#invoiceNumber").value
+    );
+
+    // FIX: Backend expects invoiceDate, not date.
+    formData.append(
+      "invoiceDate",
+      $("#invoiceDate").value
+    );
+
+    formData.append(
+      "note",
+      $("#invoiceNote").value
+    );
+
+    formData.append(
+      "items",
+      JSON.stringify(entries)
+    );
+
+    if (currentDraftId) {
+      formData.append(
+        "draftId",
+        currentDraftId
+      );
+    }
+
+    const attachment =
+      $("#invoiceAttachment").files[0];
+
+    if (attachment) {
+      formData.append("image", attachment);
+    }
+
+    const response = await fetch(
+      "/api/transactions",
+      {
+        method: "POST",
+        credentials: "same-origin",
+        body: formData
       }
+    );
 
-      if (String(item.code).trim().toLowerCase() !== code.toLowerCase()) {
-        toast(`Invalid item code: ${code}. Select the code again.`);
-        return;
-      }
+    const data = await response.json().catch(
+      () => ({})
+    );
 
-      if (!Number.isSafeInteger(qnt) || qnt < 1) {
-        toast(`Enter a valid whole-number QNT for ${item.code}.`);
-        return;
-      }
+    if (!response.ok) {
+      throw new Error(
+        data.message || "Invoice submission failed."
+      );
+    }
 
-      if (!Number.isSafeInteger(bags) || bags < 1) {
-        toast(`Enter a valid whole-number BAGS for ${item.code}.`);
-        return;
-      }
+    resetDraftState();
 
-      if (!Number.isFinite(bagPerKg) || bagPerKg < 0) {
-        toast(`Enter a valid BAG PR KG for ${item.code}.`);
-        return;
-      }
+    toast(
+      "Invoice submitted successfully. Awaiting approval."
+    );
 
-      const totalQuantity = qnt * bags;
-      const totalKg = bags * bagPerKg;
+    await transactionsPage();
 
-      if (!Number.isSafeInteger(totalQuantity) || totalQuantity < 1) {
-        toast(`Invalid TOT. QNT for ${item.code}.`);
-        return;
-      }
+  } catch (error) {
 
-      if (!Number.isFinite(totalKg)) {
-        toast(`Invalid TOT. K.G. for ${item.code}.`);
-        return;
-      }
+    toast(error.message);
 
-      selectedItems.push({
-        itemId: item._id,
-        code: item.code,
-        qnt,
-        bags,
-        bagPerKg,
-        totalKg,
-        totalQuantity,
-        quantity: totalQuantity
+  } finally {
+
+    invoiceSubmitting = false;
+
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Submit Invoice";
+    }
+  }
+}
+
+// ---------------- INVOICE GROUPING ----------------
+
+function groupTransactionsByInvoice(rows) {
+  const groups = new Map();
+
+  sortNewest(rows).forEach(tx => {
+
+    const key = tx.batchId
+      ? `batch-${tx.batchId}`
+      : tx.invoiceNumber
+        ? `invoice-${tx.invoiceNumber}-${tx.createdBy?._id || tx.createdBy || ""}-${tx.type}`
+        : `single-${tx._id}`;
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+
+        batchId: tx.batchId || "",
+
+        invoiceNumber:
+          tx.invoiceNumber || "No Invoice Number",
+
+        date: tx.invoiceDate || tx.date || tx.createdAt,
+
+        createdAt: tx.createdAt,
+
+        type: tx.type,
+
+        status: tx.status,
+
+        createdBy: tx.createdBy?.name || "",
+
+        rows: []
       });
-
-      if (bagPerKgInput === "") {
-  missingKgItems.push(item.code);
-}
     }
 
-    // DISPATCH stock validation: combine repeated item codes.
-    // const type = form.elements.type.value;
-
-    // if (type === "DISPATCH") {
-    //   const requestedByItem = new Map();
-
-    //   for (const entry of selectedItems) {
-    //     const key = String(entry.itemId);
-    //     requestedByItem.set(
-    //       key,
-    //       (requestedByItem.get(key) || 0) + entry.totalQuantity
-    //     );
-    //   }
-
-    //   for (const [itemId, requested] of requestedByItem) {
-    //     const existing = stockItemsCache.find(x =>
-    //       String(x._id) === itemId
-    //     );
-
-    //     const available = number(existing?.stock);
-
-    //     if (requested > available) {
-    //       toast(
-    //         `Insufficient stock for ${existing?.code || "item"}. Available: ${available}, requested: ${requested}.`
-    //       );
-    //       return;
-    //     }
-    //   }
-    // }
-
-  const warning = missingKgItems.length
-  ? ` Warning: BAG PR KG missing for ${missingKgItems.join(", ")}. Calculated as 0 KG.`
-  : "";
-
-try {
-  button.disabled = true;
-  button.textContent = "Submitting...";
-
-  const formData = new FormData(form);
-
-  formData.delete("items");
-  formData.append("items", JSON.stringify(selectedItems));
-
-  const response = await fetch("/api/transactions", {
-    method: "POST",
-    body: formData,
-    credentials: "same-origin"
+    groups.get(key).rows.push(tx);
   });
 
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    throw new Error(data.message || "Unable to submit invoice.");
-  }
-
-  toast((data.message || "Invoice submitted for approval.") + warning);
-
-  await transactionsPage();
-
-} catch (error) {
-  toast(error.message);
-  button.disabled = false;
-  button.textContent = "Submit Invoice for Approval";
-}
-  };
+  return [...groups.values()].sort((a, b) =>
+    new Date(b.createdAt || 0) -
+    new Date(a.createdAt || 0)
+  );
 }
 
-// Admin approvals
+// ---------------- RENDER INVOICE GROUPS ----------------
 
+function renderInvoiceGroups(rows) {
+  const groups = groupTransactionsByInvoice(rows);
 
-async function approvalsPage() {
-  if (me.role !== "admin") {
-    throw new Error("Admin access only.");
+  if (!groups.length) {
+    return `
+      <div class="empty">
+        No invoices found.
+      </div>
+    `;
   }
 
-  const [pending, summary] = await Promise.all([
-    api("/admin/pending-transactions"),
-    api("/admin/summary")
-  ]);
+  return `
+    <div class="invoice-groups">
 
-  const grouped = new Map();
+      ${groups.map((group, index) => `
+        <details class="panel invoice-group"
+          ${index === 0 ? "open" : ""}>
 
-  pending.forEach(t => {
-    const key = t.batchId || t._id;
+          <summary>
+            <div class="invoice-group-heading">
 
-    if (!grouped.has(key)) {
-      grouped.set(key, []);
-    }
+              <b>
+                ${esc(group.invoiceNumber)}
+              </b>
 
-    grouped.get(key).push(t);
-  });
+              <span class="${
+                group.type === "RECEIVE"
+                  ? "green"
+                  : "red"
+              }">
+                ${esc(group.type)}
+              </span>
 
-  $("#content").innerHTML = `
-    <div class="grid">
-      ${stat("PENDING ENTRIES", summary.pendingTransactions)}
-      ${stat("PENDING USERS", summary.pendingUsers)}
-      ${stat("APPROVED USERS", summary.users)}
-      ${stat("ALL TRANSACTIONS", summary.transactions)}
-    </div>
+              <span class="badge ${esc(group.status)}">
+                ${esc(group.status)}
+              </span>
 
-    <div class="section-head">
-      <h2>Invoices Awaiting Review</h2>
-    </div>
+              <small>
+                ${fmtDate(group.createdAt)}
+              </small>
 
-    ${grouped.size ? [...grouped.entries()].map(([key, rows]) => {
-      const first = rows[0];
+              <small>
+                ${group.rows.length} item(s)
+              </small>
 
-      return `
-        <div class="panel" style="margin-bottom:16px">
-          <div class="section-head">
-            <div>
-              <h3>Invoice: ${esc(first.invoiceNumber || "Not provided")}</h3>
-              <p class="hint">
-                ${rows.length} item line(s) ·
-                ${esc(first.createdBy?.name || "")} ·
-                ${fmtDate(first.createdAt)}
-              </p>
             </div>
+          </summary>
 
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="action good"
-                onclick="reviewTx('${key}','${first.batchId ? "batch" : "single"}','approve')">
-                Approve Invoice
-              </button>
+          <div class="invoice-group-body">
 
-              <button class="action bad"
-                onclick="reviewTx('${key}','${first.batchId ? "batch" : "single"}','reject')">
-                Reject Invoice
-              </button>
-            </div>
+            <p>
+              User: ${esc(group.createdBy || "—")}
+            </p>
+
+            ${txTable(group.rows, false, true)}
+
           </div>
 
-          ${txTable(rows)}
-        </div>
-      `;
-    }).join("") : `
-      <div class="empty">No pending transactions.</div>
-    `}
+        </details>
+      `).join("")}
+
+    </div>
   `;
 }
 
+// ---------------- TRANSACTION HISTORY FILTER ----------------
 
-window.reviewTx = async (id, kind, decision) => {
+function filterTransactionHistory() {
+  const search = (
+    $("#transactionSearch")?.value || ""
+  ).toLowerCase();
+
+  const filter =
+    $("#transactionFilter")?.value || "ALL";
+
+  let rows = [...transactionGroupsCache];
+
+  if (
+    filter === "RECEIVE" ||
+    filter === "DISPATCH"
+  ) {
+    rows = rows.filter(t =>
+      t.type === filter
+    );
+
+  } else if (filter !== "ALL") {
+
+    rows = rows.filter(t =>
+      t.status === filter
+    );
+  }
+
+  if (search) {
+
+    rows = rows.filter(t => {
+
+      const item = t.item || {};
+
+      return [
+        t.invoiceNumber,
+        item.code,
+        item.name,
+        t.type,
+        t.status,
+        t.createdBy?.name
+      ].some(v =>
+        String(v || "")
+          .toLowerCase()
+          .includes(search)
+      );
+    });
+  }
+
+  renderTransactionHistory(rows);
+}
+
+function renderTransactionHistory(rows) {
+  const area = $("#transactionHistory");
+
+  if (area) {
+    area.innerHTML = renderInvoiceGroups(rows);
+  }
+}
+
+// ---------------- APPROVALS PAGE ----------------
+
+// ---------------- APPROVALS PAGE ----------------
+
+async function approvalsPage() {
+  try {
+    const rows = await api("/transactions");
+
+    const pending = (rows || []).filter(tx =>
+      tx.status === "pending"
+    );
+
+    const groups = groupTransactionsByInvoice(pending);
+
+    $("#content").innerHTML = `
+      <div class="section-head">
+        <h2>Pending Approvals</h2>
+
+        <button
+          type="button"
+          class="action"
+          onclick="approvalsPage()">
+          Refresh
+        </button>
+      </div>
+
+      <div id="approvalList">
+
+        ${
+          groups.length
+            ? groups.map(group => `
+              <div class="panel">
+
+                <div class="section-head">
+
+                  <div>
+                    <h3>
+                      ${esc(group.invoiceNumber)}
+                    </h3>
+
+                    <small>
+                      ${fmtDate(group.createdAt)}
+                    </small>
+
+                    <small>
+                      ${esc(group.type)}
+                    </small>
+
+                    <small>
+                      User: ${esc(group.createdBy || "—")}
+                    </small>
+                  </div>
+
+                  <div class="toolbar">
+
+                    <button
+                      type="button"
+                      class="action good"
+                      onclick="reviewTx('${esc(group.batchId || group.rows[0]._id)}','approve','${group.batchId ? "batch" : "single"}')">
+                      Approve All
+                    </button>
+
+                    <button
+                      type="button"
+                      class="action bad"
+                      onclick="reviewTx('${esc(group.batchId || group.rows[0]._id)}','reject','${group.batchId ? "batch" : "single"}')">
+                      Reject All
+                    </button>
+
+                  </div>
+
+                </div>
+
+                ${txTable(group.rows, true, false)}
+
+              </div>
+            `).join("")
+
+            : `
+              <div class="empty">
+                No pending approvals.
+              </div>
+            `
+        }
+
+      </div>
+    `;
+
+  } catch (error) {
+    console.error("Approvals page error:", error);
+
+    $("#content").innerHTML = `
+      <div class="panel">
+        <h3>Unable to load approvals</h3>
+        <p>${esc(error.message)}</p>
+
+        <button
+          type="button"
+          class="action"
+          onclick="approvalsPage()">
+          Try Again
+        </button>
+      </div>
+    `;
+  }
+}
+
+// ---------------- REVIEW TRANSACTION ----------------
+
+async function reviewTx(id, action, mode = "single") {
+  if (!["approve", "reject"].includes(action)) {
+    return;
+  }
+
   let reason = "";
 
-  if (decision === "reject") {
-    reason = prompt("Reason for rejection (optional):") || "Rejected by admin";
+  if (action === "reject") {
+    reason = prompt("Enter rejection reason:");
+
+    if (reason === null) {
+      return;
+    }
+
+    reason = reason.trim();
+
+    if (!reason) {
+      toast("Rejection reason is required.");
+      return;
+    }
+  }
+
+  const actionLabel =
+    action === "approve" ? "approve" : "reject";
+
+  if (!confirm(`Are you sure you want to ${actionLabel} this transaction?`)) {
+    return;
   }
 
   try {
-    const url = kind === "batch"
-      ? `/transactions/batch/${id}/review`
-      : `/transactions/${id}/review`;
+    const endpoint = mode === "batch"
+      ? `/transactions/batch/${encodeURIComponent(id)}/review`
+      : `/transactions/${encodeURIComponent(id)}/review`;
 
-    const d = await api(url, {
+    // FIX: Backend expects decision and reason.
+    await api(endpoint, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify({
-        decision,
-        reason,
-        rejectionReason: reason
+        decision: action,
+        reason
       })
     });
 
-    toast(d.message || "Review completed.");
-    await approvalsPage();
-  } catch (error) {
-    toast(error.message);
-  }
-};
+    toast(
+      action === "approve"
+        ? "Transaction approved successfully."
+        : "Transaction rejected successfully."
+    );
 
-// Admin-only deletion
-
-window.deleteItem = async id => {
-  if (me?.role !== "admin") {
-    return toast("Admin access only.");
-  }
-
-  const item = stockItemsCache.find(x =>
-    String(x._id) === String(id)
-  );
-
-  if (!item) return toast("Item not found.");
-
-  const confirmed = confirm(
-    `Delete item ${item.code} - ${item.name}?\n\nItems with transaction history cannot be deleted.`
-  );
-
-  if (!confirmed) return;
-
-  try {
-    const d = await api(`/items/${id}`, {
-      method: "DELETE"
-    });
-
-    toast(d.message || "Item deleted successfully.");
-    await stockPage();
-  } catch (error) {
-    toast(error.message);
-  }
-};
-
-window.deleteTransaction = async (id, batchId = "", itemId = "") => {
-  if (me?.role !== "admin") {
-    return toast("Admin access only.");
-  }
-
-  const isBatch = Boolean(batchId);
-
-  const confirmed = confirm(
-    isBatch
-      ? "Delete this complete invoice and all its item entries?\n\nThis action cannot be undone."
-      : "Delete this transaction entry?\n\nThis action cannot be undone."
-  );
-
-  if (!confirmed) return;
-
-  try {
-    const url = isBatch
-      ? `/transactions/batch/${encodeURIComponent(batchId)}`
-      : `/transactions/${encodeURIComponent(id)}`;
-
-    const d = await api(url, {
-      method: "DELETE"
-    });
-
-    toast(d.message || "Transaction deleted successfully.");
-
-    if (itemId) {
-      stockItemsCache = await api("/items");
-      await showItemHistory(itemId);
+    if (currentPage === "approvals") {
+      await approvalsPage();
     } else if (currentPage === "transactions") {
+      await transactionsPage();
+    } else {
+      await dashboard();
+    }
+
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+// ---------------- DELETE TRANSACTION ----------------
+
+async function deleteTransaction(id) {
+  if (!confirm("Delete this transaction?")) {
+    return;
+  }
+
+  try {
+    await api(`/transactions/${encodeURIComponent(id)}`, {
+      method: "DELETE"
+    });
+
+    toast("Transaction deleted successfully.");
+
+    if (currentPage === "transactions") {
       await transactionsPage();
     } else if (currentPage === "approvals") {
       await approvalsPage();
     } else {
       await dashboard();
     }
+
   } catch (error) {
     toast(error.message);
   }
-};
+}
 
-// User management
+// ---------------- USER MANAGEMENT ----------------
 
 async function usersPage() {
-  if (me.role !== "admin") {
-    throw new Error("Admin access only.");
-  }
-
   const users = await api("/admin/users");
 
   $("#content").innerHTML = `
     <div class="section-head">
-      <h2>All Registered Users</h2>
+      <h2>User Management</h2>
+
+      <button class="action"
+        onclick="usersPage()">
+        Refresh
+      </button>
     </div>
 
-    <div class="panel table-wrap">
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Username</th>
-            <th>Role</th>
-            <th>Status</th>
-            <th>Joined</th>
-            <th>Action</th>
-          </tr>
-        </thead>
+    <div class="panel">
+      <div class="table-wrap">
 
-        <tbody>
-          ${users.map(u => `
+        <table>
+          <thead>
             <tr>
-              <td>${esc(u.name)}</td>
-              <td>@${esc(u.username)}</td>
-              <td>${esc(u.role)}</td>
-              <td>
-                <span class="badge ${esc(u.status)}">${esc(u.status)}</span>
-              </td>
-              <td>${new Date(u.createdAt).toLocaleDateString()}</td>
-              <td>
-                ${u.role === "user" && u.status === "pending" ? `
-                  <button class="action good"
-                    onclick="userReview('${u._id}','approved')">
-                    Approve
-                  </button>
-
-                  <button class="action bad"
-                    onclick="userReview('${u._id}','rejected')">
-                    Reject
-                  </button>
-                ` : "—"}
-              </td>
+              <th>Name</th>
+              <th>Username</th>
+              <th>Role</th>
+              <th>Status</th>
+              <th>Created</th>
+              <th>Action</th>
             </tr>
-          `).join("")}
-        </tbody>
-      </table>
+          </thead>
+
+          <tbody>
+            ${
+              (users || []).map(user => `
+                <tr>
+                  <td>${esc(user.name)}</td>
+
+                  <td>${esc(user.username)}</td>
+
+                  <td>${esc(user.role)}</td>
+
+                  <td>
+                    <span class="badge ${esc(user.status)}">
+                      ${esc(user.status)}
+                    </span>
+                  </td>
+
+                  <td>
+                    ${fmtDate(user.createdAt)}
+                  </td>
+
+                  <td>
+                    ${
+                      user.role !== "admin"
+                        ? `
+                          <div class="toolbar">
+
+                            ${
+                              user.status !== "approved"
+                                ? `
+                                  <button class="action good"
+                                    onclick="userReview('${esc(user._id)}','approved')">
+                                    Approve
+                                  </button>
+                                `
+                                : ""
+                            }
+
+                            ${
+                              user.status !== "rejected"
+                                ? `
+                                  <button class="action danger"
+                                    onclick="userReview('${esc(user._id)}','rejected')">
+                                    Reject
+                                  </button>
+                                `
+                                : ""
+                            }
+
+                          </div>
+                        `
+                        : "Admin"
+                    }
+                  </td>
+                </tr>
+              `).join("")
+            }
+
+            ${
+              !users?.length
+                ? `
+                  <tr>
+                    <td colspan="6">
+                      No users found.
+                    </td>
+                  </tr>
+                `
+                : ""
+            }
+          </tbody>
+        </table>
+
+      </div>
     </div>
   `;
 }
 
-window.userReview = async (id, status) => {
+// ---------------- APPROVE / REJECT USER ----------------
+
+async function userReview(id, status) {
+  if (!["approved", "rejected"].includes(status)) {
+    return;
+  }
+
+  const label =
+    status === "approved" ? "approve" : "reject";
+
+  if (!confirm(`Are you sure you want to ${label} this user?`)) {
+    return;
+  }
+
   try {
-    const d = await api(`/admin/users/${id}`, {
+    await api(`/admin/users/${encodeURIComponent(id)}`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status })
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        status
+      })
     });
 
-    toast(d.message || "User " + status);
+    toast(
+      status === "approved"
+        ? "User approved successfully."
+        : "User rejected successfully."
+    );
+
     await usersPage();
+
   } catch (error) {
     toast(error.message);
   }
-};
+}
 
-// Team Chat
+// ---------------- TEAM CHAT ----------------
+
+let chatLoading = false;
 
 async function chatPage() {
+  clearInterval(chatTimer);
+  chatTimer = null;
+
   $("#content").innerHTML = `
-    <div class="panel">
-      <h2>JW-ST Team Chat</h2>
-      <p class="hint">
-        Share updates, questions and item photos with your team.
-      </p>
+    <div class="section-head">
+      <h2>Team Chat</h2>
+    </div>
 
-      <div id="messages" class="chat-box"></div>
+    <div class="panel chat-panel">
 
-      <form id="chatForm" class="chat-send">
-        <input name="text" placeholder="Type a message...">
+      <div id="messages" class="messages">
+        Loading messages...
+      </div>
 
-        <input id="chatImage" type="file"
+      <form id="chatForm" class="chat-form">
+
+        <input
+          id="chatMessage"
+          name="message"
+          placeholder="Type your message..."
+          autocomplete="off">
+
+        <input
+          id="chatImage"
           name="image"
-          accept="image/jpeg,image/png,image/webp,image/gif">
+          type="file"
+          accept="image/*">
 
-        <div id="chatImagePreview" class="chat-image-preview"></div>
+        <button type="submit"
+          class="action good">
+          Send
+        </button>
 
-        <button class="primary" type="submit">Send</button>
       </form>
+
     </div>
   `;
 
-  const form = $("#chatForm");
-  const imageInput = $("#chatImage");
-  const preview = $("#chatImagePreview");
+  $("#chatForm").onsubmit = sendChatMessage;
 
-  imageInput.addEventListener("change", () => {
-    preview.innerHTML = "";
+  await loadChatMessages();
 
-    const file = imageInput.files[0];
-    if (!file) return;
-
-    if (!file.type.startsWith("image/")) {
-      imageInput.value = "";
-      return toast("Please select a valid image.");
+  chatTimer = setInterval(() => {
+    if (currentPage === "chat") {
+      loadChatMessages();
     }
+  }, 5000);
+}
 
-    if (file.size > 5 * 1024 * 1024) {
-      imageInput.value = "";
-      return toast("Image must be smaller than 5 MB.");
-    }
+// ---------------- LOAD CHAT MESSAGES ----------------
 
-    const url = URL.createObjectURL(file);
+async function loadChatMessages() {
+  const area = $("#messages");
 
-    preview.innerHTML = `
-      <img src="${url}" alt="Selected image preview">
-      <button type="button" id="removeChatImage">Remove image</button>
-    `;
-
-    $("#removeChatImage").onclick = () => {
-      URL.revokeObjectURL(url);
-      imageInput.value = "";
-      preview.innerHTML = "";
-    };
-  });
-
-  async function load() {
-    if (currentPage !== "chat") return;
-
-    try {
-      const msgs = await api("/chat");
-
-      if (currentPage !== "chat") return;
-
-      const box = $("#messages");
-      if (!box) return;
-
-      const nearBottom =
-        box.scrollHeight - box.scrollTop - box.clientHeight < 100;
-
-      box.innerHTML = msgs.map(m => `
-        <div class="bubble ${
-          String(m.sender?._id) === String(me?.id || me?._id)
-            ? "mine"
-            : ""
-        }">
-          <small>
-            ${esc(m.sender?.name || "User")} · ${fmtDate(m.createdAt)}
-          </small>
-
-          ${m.text ? `<p>${esc(m.text)}</p>` : ""}
-
-          ${m.image ? `
-            <a href="${esc(m.image)}" target="_blank" rel="noopener">
-              <img class="chat-message-image"
-                src="${esc(m.image)}"
-                alt="Shared image"
-                loading="lazy">
-            </a>
-          ` : ""}
-        </div>
-      `).join("") || `
-        <div class="empty">
-          No messages yet. Start the conversation.
-        </div>
-      `;
-
-      if (nearBottom) {
-        box.scrollTop = box.scrollHeight;
-      }
-    } catch (error) {
-      console.error("Chat loading error:", error);
-    }
+  if (!area || chatLoading) {
+    return;
   }
 
-  form.onsubmit = async e => {
-    e.preventDefault();
+  chatLoading = true;
 
-    const button = form.querySelector('button[type="submit"]');
-    const file = imageInput.files[0];
-    const text = form.elements.text.value.trim();
+  try {
+    const wasNearBottom =
+      area.scrollHeight - area.scrollTop - area.clientHeight < 100;
 
-    if (!text && !file) {
-      return toast("Write a message or select an image.");
+    const messages = await api("/chat");
+
+    if (!$("#messages")) {
+      return;
     }
 
-    try {
-      button.disabled = true;
-      button.textContent = "Sending...";
+    $("#messages").innerHTML = (messages || []).map(message => {
+      const sender = message.sender || message.user || {};
 
-      const d = await fileForm(form, "/chat");
+      const senderId =
+        sender._id || sender.id || message.senderId || "";
 
-      toast(d.message || "Message sent successfully.");
+      const ownMessage =
+        String(senderId) === String(me?._id || me?.id || "");
 
-      form.reset();
-      preview.innerHTML = "";
+      const messageText =
+        message.message || message.text || "";
 
-      await load();
-    } catch (error) {
-      toast(error.message);
-    } finally {
-      button.disabled = false;
-      button.textContent = "Send";
+      const imageUrl =
+        message.image ||
+        message.imageUrl ||
+        "";
+
+      return `
+        <div class="message ${ownMessage ? "own" : ""}">
+
+          <div class="message-meta">
+            <b>${esc(sender.name || message.senderName || "User")}</b>
+
+            <small>
+              ${fmtDate(message.createdAt)}
+            </small>
+          </div>
+
+          ${
+            messageText
+              ? `<div class="message-text">${esc(messageText)}</div>`
+              : ""
+          }
+
+          ${
+            imageUrl
+              ? `
+                <a href="${esc(imageUrl)}"
+                  target="_blank"
+                  rel="noopener noreferrer">
+                  <img
+                    src="${esc(imageUrl)}"
+                    class="chat-image"
+                    alt="Shared image"
+                    loading="lazy">
+                </a>
+              `
+              : ""
+          }
+
+        </div>
+      `;
+    }).join("") || `
+      <div class="empty">
+        No messages yet. Start the conversation.
+      </div>
+    `;
+
+    if (wasNearBottom) {
+      area.scrollTop = area.scrollHeight;
     }
-  };
 
-  await load();
+  } catch (error) {
+    if ($("#messages")) {
+      $("#messages").innerHTML = `
+        <div class="empty">
+          ${esc(error.message)}
+        </div>
+      `;
+    }
 
-  if (currentPage === "chat") {
-    chatTimer = setInterval(load, 5000);
+  } finally {
+    chatLoading = false;
   }
 }
 
-// Password show / hide
+// ---------------- SEND CHAT MESSAGE ----------------
 
-document.addEventListener("click", e => {
-  const button = e.target.closest(".password-toggle");
+async function sendChatMessage(e) {
+  e.preventDefault();
+
+  const form = $("#chatForm");
+
+  if (!form) {
+    return;
+  }
+
+  const messageInput = $("#chatMessage");
+  const imageInput = $("#chatImage");
+
+  const message = messageInput.value.trim();
+  const image = imageInput.files[0];
+
+  if (!message && !image) {
+    toast("Enter a message or select an image.");
+    return;
+  }
+
+  const button = form.querySelector(
+    'button[type="submit"]'
+  );
+
+  try {
+    button.disabled = true;
+    button.textContent = "Sending...";
+
+    const formData = new FormData();
+
+    formData.append("message", message);
+
+    if (image) {
+      formData.append("image", image);
+    }
+
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      credentials: "same-origin",
+      body: formData
+    });
+
+    const data = await response.json().catch(
+      () => ({})
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        data.message || "Message could not be sent."
+      );
+    }
+
+    messageInput.value = "";
+    imageInput.value = "";
+
+    await loadChatMessages();
+
+    const area = $("#messages");
+
+    if (area) {
+      area.scrollTop = area.scrollHeight;
+    }
+
+  } catch (error) {
+    toast(error.message);
+
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Send";
+    }
+  }
+}
+
+
+// ---------------- PASSWORD VISIBILITY ----------------
+
+document.addEventListener("click", function(e) {
+  const button = e.target.closest(
+    ".password-toggle, [data-password-toggle], [data-target]"
+  );
+
   if (!button) return;
 
-  const input = document.getElementById(button.dataset.target);
-  if (!input) return;
+  let targetId =
+    button.dataset.passwordToggle ||
+    button.dataset.target ||
+    button.getAttribute("aria-controls") ||
+    "";
+
+  targetId = targetId.replace(/^#/, "");
+
+  let input = targetId
+    ? document.getElementById(targetId)
+    : null;
+
+  // Fallback: find password input inside the same wrapper.
+  if (!input) {
+    const wrapper = button.closest(
+      ".password-wrapper, .password-field, .input-group"
+    ) || button.parentElement;
+
+    input = wrapper?.querySelector('input[type="password"], input[type="text"]');
+  }
+
+  if (!input) {
+    console.error("Password input not found for toggle button:", button);
+    return;
+  }
 
   const isHidden = input.type === "password";
 
   input.type = isHidden ? "text" : "password";
-  button.textContent = isHidden ? "🙈" : "👁";
 
   button.setAttribute(
     "aria-label",
     isHidden ? "Hide password" : "Show password"
   );
+
+  button.setAttribute(
+    "title",
+    isHidden ? "Hide password" : "Show password"
+  );
+
+  button.classList.toggle("password-visible", isHidden);
 });
 
-// Start application
+
+// ---------------- APPLICATION START ----------------
 
 boot();

@@ -151,6 +151,7 @@ app.use("/api", async (req, res, next) => {
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/items", require("./routes/items"));
 app.use("/api/transactions", require("./routes/transactions"));
+app.use("/api/drafts", require("./routes/drafts"));
 app.use("/api/admin", require("./routes/admin"));
 app.use("/api/chat", require("./routes/chat"));
 

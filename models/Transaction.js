@@ -6,7 +6,8 @@ const schema = new mongoose.Schema(
     item: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Item",
-      required: true
+      required: true,
+      index: true
     },
 
     type: {
@@ -15,7 +16,6 @@ const schema = new mongoose.Schema(
       required: true
     },
 
-    // Invoice fields
     qnt: {
       type: Number,
       required: true,
@@ -24,8 +24,8 @@ const schema = new mongoose.Schema(
 
     bags: {
       type: Number,
-      default: 0,
-      min: 0
+      default: 1,
+      min: 1
     },
 
     bagPerKg: {
@@ -40,18 +40,26 @@ const schema = new mongoose.Schema(
       min: 0
     },
 
-    // Final stock quantity (TOT.QNT)
     totalQuantity: {
       type: Number,
       required: true,
       min: 1
     },
 
-    // Backward-compatible stock quantity
     quantity: {
       type: Number,
       required: true,
       min: 1
+    },
+
+    manualTotalQuantity: {
+      type: Boolean,
+      default: false
+    },
+
+    manualTotalKg: {
+      type: Boolean,
+      default: false
     },
 
     batchId: {
@@ -86,13 +94,15 @@ const schema = new mongoose.Schema(
     status: {
       type: String,
       enum: ["pending", "approved", "rejected"],
-      default: "pending"
+      default: "pending",
+      index: true
     },
 
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      required: true
+      required: true,
+      index: true
     },
 
     reviewedBy: {
@@ -119,10 +129,9 @@ const schema = new mongoose.Schema(
 
 schema.index({ batchId: 1, status: 1 });
 schema.index({ invoiceNumber: 1, createdBy: 1 });
-
 schema.index({ createdAt: -1 });
 schema.index({ createdBy: 1, createdAt: -1 });
 
-module.exports = mongoose.model("Message", schema);
-
-module.exports = mongoose.model("Transaction", schema);
+module.exports =
+  mongoose.models.Transaction ||
+  mongoose.model("Transaction", schema);
