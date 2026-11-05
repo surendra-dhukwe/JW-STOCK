@@ -8,18 +8,20 @@ dns.setServers(["8.8.8.8", "1.1.1.1"]);
 const express = require("express");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
+const compression = require("compression");
 const path = require("path");
 const bcrypt = require("bcryptjs");
 const User = require("./models/User");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const isProduction = process.env.NODE_ENV === "production";
 
-// MongoDB connection cache
 let dbConnectionPromise = null;
 let initializationPromise = null;
 
-// Connect MongoDB and initialize Admin
+// ---------------- DATABASE INITIALIZATION ----------------
+
 async function initializeApp() {
   if (!process.env.MONGO_URI) {
     throw new Error("MONGO_URI is missing in environment variables.");
@@ -27,7 +29,12 @@ async function initializeApp() {
 
   if (mongoose.connection.readyState !== 1) {
     if (!dbConnectionPromise) {
-      dbConnectionPromise = mongoose.connect(process.env.MONGO_URI)
+      dbConnectionPromise = mongoose
+        .connect(process.env.MONGO_URI, {
+          maxPoolSize: 10,
+          minPoolSize: 2,
+          serverSelectionTimeoutMS: 10000
+        })
         .then(() => {
           console.log("MongoDB Atlas Connected Successfully!");
         })
@@ -40,21 +47,20 @@ async function initializeApp() {
     await dbConnectionPromise;
   }
 
-  // Create Admin only if not already present
-  const username = (
+  const username = String(
     process.env.ADMIN_USERNAME || "admin"
-  ).toLowerCase();
+  ).trim().toLowerCase();
 
-  let admin = await User.findOne({ username });
+  const admin = await User.findOne({ username }).lean();
 
   if (!admin) {
     const password = process.env.ADMIN_PASSWORD;
 
     if (!password) {
-      throw new Error("ADMIN_PASSWORD is missing in environment variables.");
+      throw new Error("ADMIN_PASSWORD is missing.");
     }
 
-    admin = await User.create({
+    await User.create({
       name: process.env.ADMIN_NAME || "JW-ST Admin",
       username,
       passwordHash: await bcrypt.hash(password, 12),
@@ -66,7 +72,6 @@ async function initializeApp() {
   }
 }
 
-// Initialize only once per running instance
 async function ensureInitialized() {
   if (!initializationPromise) {
     initializationPromise = initializeApp().catch(error => {
@@ -78,8 +83,57 @@ async function ensureInitialized() {
   await initializationPromise;
 }
 
-// Middleware: initialize before handling requests
-app.use(async (req, res, next) => {
+// ---------------- MIDDLEWARE ----------------
+
+app.disable("x-powered-by");
+
+// Compress responses
+app.use(compression({
+  threshold: 1024
+}));
+
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({
+  extended: true,
+  limit: "2mb"
+}));
+
+app.use(cookieParser());
+
+// Static files
+app.use(
+  express.static(path.join(__dirname, "public"), {
+    maxAge: isProduction ? "7d" : 0,
+    etag: true,
+    lastModified: true
+  })
+);
+
+// Legacy uploads
+app.use(
+  "/uploads",
+  express.static(path.join(__dirname, "uploads"), {
+    maxAge: isProduction ? "7d" : 0,
+    etag: true
+  })
+);
+
+// ---------------- HEALTH CHECK ----------------
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    app: "JW-ST",
+    database:
+      mongoose.connection.readyState === 1
+        ? "connected"
+        : "disconnected"
+  });
+});
+
+// ---------------- DATABASE MIDDLEWARE ----------------
+
+app.use("/api", async (req, res, next) => {
   try {
     await ensureInitialized();
     next();
@@ -92,51 +146,52 @@ app.use(async (req, res, next) => {
   }
 });
 
-// Body parsers and cookies
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
-app.use(cookieParser());
+// ---------------- API ROUTES ----------------
 
-// Static files
-app.use(express.static(path.join(__dirname, "public")));
-
-// Legacy uploads support
-app.use(
-  "/uploads",
-  express.static(path.join(__dirname, "uploads"))
-);
-
-// API Routes
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/items", require("./routes/items"));
 app.use("/api/transactions", require("./routes/transactions"));
 app.use("/api/admin", require("./routes/admin"));
 app.use("/api/chat", require("./routes/chat"));
 
-// Health check
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    app: "JW-ST",
-    database: mongoose.connection.readyState === 1
-      ? "connected"
-      : "disconnected"
+// API not found
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    message: "API endpoint not found."
   });
 });
 
-// Frontend
+// ---------------- FRONTEND FALLBACK ----------------
+
 app.get("*", (req, res) => {
   res.sendFile(
     path.join(__dirname, "public", "index.html")
   );
 });
 
-// Local development only
+// ---------------- ERROR HANDLER ----------------
+
+app.use((error, req, res, next) => {
+  console.error("Server error:", error);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  res.status(error.status || 500).json({
+    message:
+      error.status && error.status < 500
+        ? error.message
+        : "Internal server error."
+  });
+});
+
+// ---------------- START SERVER ----------------
+
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`JW-ST running at http://localhost:${PORT}`);
   });
 }
 
-// Export Express app for Vercel
 module.exports = app;
